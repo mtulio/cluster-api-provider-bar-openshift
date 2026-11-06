@@ -1,0 +1,168 @@
+# Several objects in one file, which manifests/ would reject and this
+# directory does not: manifests/ is applied by the bootstrap node, which counts
+# documents and refuses a multi-document file
+# (pkg/asset/manifests/openshift.go:426). This tree is read by the installer's
+# local Cluster API control plane, which decodes multi-document YAML correctly
+# (ObjectsFromManifest).
+# Worker machines for a `platform: external` install driven by CAPOCI.
+#
+# Carried over from the OCI pilot. See ../cluster.yaml for provenance.
+#
+# OPTIONAL: delete this file and the install still succeeds as a compact
+# three-node cluster. Most of the AWS pilot runs did exactly that.
+#
+#
+# WHY THIS FILE HAS TO EXIST AT ALL
+#
+# On an integrated platform there are no worker Machines in a directory like
+# this, and their absence is correct: workers arrive after bootstrap, created
+# by machine-api from MachineSets the installer generates, reconciled
+# in-cluster by that cloud's actuator.
+#
+# A non-integrated provider ships no machine-api actuator, and the installer
+# generates no MachineSets for this platform --
+# pkg/asset/machines/worker.go:807 is `case externaltypes.Name, nonetypes.Name:`
+# with an empty body. So nothing ever creates a worker. Without this file the
+# cluster is permanently capped at its control plane; day-0 Cluster API
+# Machines are the only way a `platform: external` cluster gets compute today.
+#
+# This is a real limitation, not a pilot shortcut. These Machines are created
+# once, by the installer, and nothing reconciles them afterwards: no scaling,
+# no replacement of a failed node, no MachineSet. Day-2 compute for
+# non-integrated providers is unsolved.
+#
+# Oracle has in fact already solved a version of this for OCI, differently:
+# oci-openshift ships a cluster-autoscaler bundle that runs CAPI core AND
+# CAPOCI *inside* the installed cluster
+# (custom_manifests/manifests/08,09,10-autoscaling-operator*.yml). That is a
+# legitimate day-2 answer and it is out of scope here -- this pilot is about
+# whether the INSTALLER can drive CAPOCI, not about what runs afterwards. It
+# is worth knowing it exists before anyone designs a day-2 story from scratch.
+#
+#
+# WHAT IS DIFFERENT FROM A MASTER
+#
+# 1. NO `cluster.x-k8s.io/control-plane` LABEL. Its absence is the whole
+#    definition of a worker, read through util.IsControlPlaneMachine. On
+#    CAPOCI the consequence that matters is load-balancer registration:
+#    cloud/scope/machine.go:835 and :874 add a machine to the API server
+#    backend set only for control-plane machines. A worker must not answer on
+#    6443 or 22623, and its absence from those backends is the correct
+#    outcome, not a defect to fix.
+#
+# 2. `dataSecretName: ${INSTALLER_INFRA_ID}-worker`. Pointing a worker at
+#    ${INSTALLER_INFRA_ID}-master would hand it the master pointer config and it would
+#    join as a control-plane node.
+#
+# 3. The pointer aims at https://api-int.<clusterDomain>:22623/config/worker,
+#    so it depends on the same hook-created DNS and the same hook-created
+#    22623 listener the masters depend on.
+#
+#
+# CSR APPROVAL IS MANUAL, AND THAT IS THE DECISION
+#
+# These nodes boot, request client and serving certificates, and then wait.
+# Nothing approves them: cluster-machine-approver auto-approves against a
+# machine-api Machine, and on this platform there is none.
+#
+#   oc get csr -o name | xargs oc adm certificate approve   # twice, a few
+#                                                           # minutes apart
+#
+# Accepted as the baseline on 2026-09-30 -- it is the normal non-integrated
+# experience, not a defect unique to this work. The intended direction is a
+# webhook or controller that evaluates a CSR against the node it claims to be
+# for and approves without a human; not scheduled.
+#
+# Variables:
+#   ${INSTALLER_INFRA_ID}   supplied by the installer -- the infrastructure ID
+#   ${OCI_IMAGE_ID}         the imported RHCOS custom image OCID
+#   ${OCI_COMPARTMENT_ID}   the compartment the machines are launched into
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Machine
+metadata:
+  name: ${INSTALLER_INFRA_ID}-worker-0
+  namespace: openshift-cluster-api-guests
+spec:
+  clusterName: ${INSTALLER_INFRA_ID}
+  bootstrap:
+    dataSecretName: ${INSTALLER_INFRA_ID}-worker
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+    kind: OCIMachine
+    name: ${INSTALLER_INFRA_ID}-worker-0
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: OCIMachine
+metadata:
+  name: ${INSTALLER_INFRA_ID}-worker-0
+  namespace: openshift-cluster-api-guests
+spec:
+  compartmentId: ${OCI_COMPARTMENT_ID}
+  imageId: ${OCI_IMAGE_ID}
+  shape: ${OCI_SHAPE:="VM.Standard.E4.Flex"}
+  shapeConfig:
+    ocpus: '${OCI_OCPUS:="4"}'
+    memoryInGBs: '${OCI_MEMORY_GB:="16"}'
+  bootVolumeSizeInGBs: '${OCI_BOOT_VOLUME_GB:="120"}'
+  networkDetails:
+    # DECORATIVE, for a subtler reason than on the masters. The worker path
+    # DOES honour a subnet name -- but it reads the TOP-LEVEL
+    # OCIMachine.spec.subnetName (api/v1beta2/ocimachine_types.go:142), not
+    # this one (api/v1beta2/types.go:48). Two fields, same name, different
+    # structs, and only the other one works. See 10_bootstrap.yaml.
+    #
+    # Harmless here: with no name to match, getWorkerMachineSubnet
+    # (cloud/scope/machine.go:1075) returns the first worker-role subnet, which
+    # is this one. Moving it to the top level would make it load-bearing; it is
+    # left here so all three machine manifests read the same way.
+    subnetName: ${INSTALLER_INFRA_ID}-subnet-worker
+    assignPublicIp: false
+  freeformTags:
+    openshift-cluster-id: ${INSTALLER_INFRA_ID}
+    openshift-machine-role: worker
+  metadata: {}
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Machine
+metadata:
+  name: ${INSTALLER_INFRA_ID}-worker-1
+  namespace: openshift-cluster-api-guests
+spec:
+  clusterName: ${INSTALLER_INFRA_ID}
+  bootstrap:
+    dataSecretName: ${INSTALLER_INFRA_ID}-worker
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+    kind: OCIMachine
+    name: ${INSTALLER_INFRA_ID}-worker-1
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: OCIMachine
+metadata:
+  name: ${INSTALLER_INFRA_ID}-worker-1
+  namespace: openshift-cluster-api-guests
+spec:
+  compartmentId: ${OCI_COMPARTMENT_ID}
+  imageId: ${OCI_IMAGE_ID}
+  shape: ${OCI_SHAPE:="VM.Standard.E4.Flex"}
+  shapeConfig:
+    ocpus: '${OCI_OCPUS:="4"}'
+    memoryInGBs: '${OCI_MEMORY_GB:="16"}'
+  bootVolumeSizeInGBs: '${OCI_BOOT_VOLUME_GB:="120"}'
+  networkDetails:
+    # DECORATIVE, for a subtler reason than on the masters. The worker path
+    # DOES honour a subnet name -- but it reads the TOP-LEVEL
+    # OCIMachine.spec.subnetName (api/v1beta2/ocimachine_types.go:142), not
+    # this one (api/v1beta2/types.go:48). Two fields, same name, different
+    # structs, and only the other one works. See 10_bootstrap.yaml.
+    #
+    # Harmless here: with no name to match, getWorkerMachineSubnet
+    # (cloud/scope/machine.go:1075) returns the first worker-role subnet, which
+    # is this one. Moving it to the top level would make it load-bearing; it is
+    # left here so all three machine manifests read the same way.
+    subnetName: ${INSTALLER_INFRA_ID}-subnet-worker
+    assignPublicIp: false
+  freeformTags:
+    openshift-cluster-id: ${INSTALLER_INFRA_ID}
+    openshift-machine-role: worker
+  metadata: {}
