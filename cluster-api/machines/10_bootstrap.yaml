@@ -1,0 +1,162 @@
+# Several objects in one file, which manifests/ would reject and this
+# directory does not: manifests/ is applied by the bootstrap node, which counts
+# documents and refuses a multi-document file
+# (pkg/asset/manifests/openshift.go:426). This tree is read by the installer's
+# local Cluster API control plane, which decodes multi-document YAML correctly
+# (ObjectsFromManifest).
+# Bootstrap machine for a `platform: external` install driven by CAPOCI.
+#
+# THE FILE THE WHOLE IGNITION PROBLEM IS ABOUT, and the most important finding
+# this payload carries. Read README.md, "The ignition offload, and the hook
+# that declares it", before running anything from this repository.
+#
+# THE CAP. CAPOCI base64-encodes the bootstrap data into metadata.user_data
+# (cloud/scope/machine.go:353) and OCI rejects the launch if user_data plus the
+# rest of metadata exceeds 32,000 bytes. bootstrap.ign is hundreds of
+# kilobytes. CAPOCI has no object-store offload -- no equivalent of CAPA's
+# AWSCluster.spec.s3Bucket / AWSMachine.spec.ignition.storageType -- so nothing
+# in this manifest can fix it, and nothing here tries to.
+#
+# HOW THE PILOT FIXED IT, AND HOW THIS PAYLOAD DECLARES IT. The pilot ran a
+# wrapper script between `create ignition-configs` and `create cluster`: it
+# uploaded the real bootstrap.ign to OCI Object Storage and replaced the
+# on-disk file with a ~300-byte pointer config. By the time this Machine was
+# created, <infraID>-bootstrap held the pointer and the size problem was gone.
+#
+# That step is now the ignitionReady hook, declared in openshift.yaml and
+# implemented at hooks/ignition-ready.sh. It runs once the installer's
+# ignition assets are final and before any Cluster API object is applied --
+# so before this Machine exists -- and hands the installer a pointer config at
+# the descriptor's bootstrapOutputPath. The installer reads that file in place
+# of its own bootstrap ignition, and <infraID>-bootstrap therefore holds the
+# pointer by the time anything here is reconciled.
+#
+# Nothing in this manifest changes either way: the Machine references the
+# bootstrap Secret by name and does not care how large the document behind it
+# is. The hook is what makes the reference fit in instance metadata.
+#
+# Variables:
+#   ${INSTALLER_INFRA_ID}   supplied by the installer -- the infrastructure ID
+#   ${OCI_IMAGE_ID}         the imported RHCOS custom image OCID
+#   ${OCI_COMPARTMENT_ID}   the compartment the machines are launched into
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Machine
+metadata:
+  name: ${INSTALLER_INFRA_ID}-bootstrap
+  namespace: openshift-cluster-api-guests
+  labels:
+    cluster.x-k8s.io/control-plane: ""
+spec:
+  clusterName: ${INSTALLER_INFRA_ID}
+  bootstrap:
+    # The installer chooses this name; nobody else can. It is built from the
+    # infrastructure ID in pkg/infrastructure/external/clusterapi/ignition.go,
+    # which is why this tree must be rewritten between `create manifests` and
+    # `create cluster` -- which, in image mode, nothing can. See the header.
+    dataSecretName: ${INSTALLER_INFRA_ID}-bootstrap
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+    kind: OCIMachine
+    name: ${INSTALLER_INFRA_ID}-bootstrap
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: OCIMachine
+metadata:
+  name: ${INSTALLER_INFRA_ID}-bootstrap
+  namespace: openshift-cluster-api-guests
+  labels:
+    cluster.x-k8s.io/control-plane: ""
+    install.openshift.io/bootstrap: ""
+spec:
+  compartmentId: ${OCI_COMPARTMENT_ID}
+  # No selector exists for this. OCIMachine.spec.imageId is a bare OCID --
+  # there is no imageLookup or tag filter as CAPA has for AMIs -- so the
+  # imported RHCOS image's OCID must be substituted in. Which image, and
+  # whether a generic, multi-tenant one can be published at all, is the second
+  # open blocker -- see README.md, "RHCOS boot images".
+  imageId: ${OCI_IMAGE_ID}
+  shape: ${OCI_SHAPE:="VM.Standard.E4.Flex"}
+  shapeConfig:
+    ocpus: '${OCI_OCPUS:="4"}'
+    memoryInGBs: '${OCI_MEMORY_GB:="16"}'
+  bootVolumeSizeInGBs: '${OCI_BOOT_VOLUME_GB:="120"}'
+  # PRIVATE, and not by choice -- CAPOCI gives a control-plane machine no way
+  # to be anywhere else. This is the opposite of the Foo payload, where
+  # the bootstrap is the one machine with a public IP.
+  #
+  # MEASURED, not read. This block first said
+  #
+  #     subnetName: ${INSTALLER_INFRA_ID}-subnet-cp-endpoint
+  #     assignPublicIp: true
+  #
+  # and the launch failed, leaving the instance TERMINATED and the install with
+  # no bootstrap:
+  #
+  #     400 InvalidParameter: Public IP addresses are prohibited in this subnet
+  #     CreateVnic operation in VcnInternalService
+  #
+  # The subnet in that error was NOT the one named above. It was
+  # ${INSTALLER_INFRA_ID}-subnet-control-plane (10.0.0.32/27, prohibitPublicIpOnVnic
+  # true), because CAPOCI never read the name.
+  #
+  # WHY, AND IT IS A REAL CAPOCI DEFECT RATHER THAN A MISREADING OF THE SCHEMA.
+  # The launch path (cloud/scope/machine.go:320-341) consults only the OCID
+  # forms -- networkDetails.subnetId and networkDetails.nsgIds/nsgId -- and
+  # when they are nil it falls through to role-based selection keyed on
+  # IsControlPlane(), which is true for any Machine carrying the
+  # cluster.x-k8s.io/control-plane label (machine.go:1031-1034). The two
+  # branches are not symmetric:
+  #
+  #   path            subnet by name?                NSG by name?
+  #   worker          yes, spec.subnetName   :1075   yes, nsgNames   :1091
+  #   control-plane   NO                     :1043   NO              :1052
+  #
+  # getGetControlPlaneMachineSubnet returns the first subnet with the
+  # control-plane role, unconditionally. There is no name check to fail -- the
+  # field is simply never read on this path.
+  #
+  # Worse, there are TWO subnetName fields and neither one works here.
+  # networkDetails.subnetName (api/v1beta2/types.go:48) is the one that looks
+  # natural and is read by nothing on the launch path at all; the top-level
+  # spec.subnetName (api/v1beta2/ocimachine_types.go:142) is read, but only by
+  # getWorkerMachineSubnet. So the manifest above was accepted by the webhook,
+  # stored, and silently ignored -- the failure mode a schema field should
+  # never have.
+  #
+  # Recorded as an upstream fix candidate alongside the 25-rule batching gap in
+  # cluster.yaml: getGetControlPlaneMachineSubnet and
+  # getGetControlPlaneMachineNSGs should honour a name the way their worker
+  # counterparts already do.
+  #
+  # WHAT WE GIVE UP, STATED PLAINLY. No public IP means `openshift-install
+  # gather bootstrap` cannot SSH in, and that is the command you reach for
+  # precisely when a bootstrap has failed. Use an OCI instance console
+  # connection instead (oci compute instance-console-connection create), which
+  # works without a public address. The alternative -- dropping the
+  # control-plane label so the worker path applies and a name is honoured --
+  # was rejected: it would place the bootstrap in the public cp-endpoint subnet
+  # and require a second cp-endpoint NSG egress rule to reach it, for a machine
+  # that genuinely is part of the control plane.
+  #
+  # WHAT WE DO NOT GIVE UP. The bootstrap still has everything it needs:
+  #   - egress to pull the release payload, through the NAT gateway on the
+  #     control-plane subnet's route table;
+  #   - reachability from the masters on 6443 and 22623, via the NLB's private
+  #     address, which the control-plane NSG permits from the whole VCN;
+  #   - the control-plane NSG, which the role-based selection attaches for the
+  #     same reason it chose this subnet -- here the default is what we wanted.
+  networkDetails:
+    assignPublicIp: false
+  freeformTags:
+    openshift-cluster-id: ${INSTALLER_INFRA_ID}
+    # Read by hooks/post-provision.sh to find the instances that
+    # must become backends of the 22623 listener.
+    openshift-machine-role: bootstrap
+  # metadata is merged into the instance metadata at cloud/scope/machine.go:351,
+  # BEFORE user_data is assigned at :353 -- so nothing here can shadow the
+  # bootstrap payload even by accident.
+  #
+  # ssh_authorized_keys is how OCI conventionally delivers an SSH key. It is
+  # left empty here: RHCOS takes its SSH key from Ignition, not from OCI
+  # metadata, and every byte spent here comes out of the 32,000-byte budget.
+  metadata: {}
