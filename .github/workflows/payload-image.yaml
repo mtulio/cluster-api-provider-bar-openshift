@@ -18,17 +18,15 @@
 #
 # WHAT DIFFERS FROM THE FOO PAYLOAD'S IDENTICAL WORKFLOW
 #
-# Bar ships two files where Foo ships one: bin/controller is a POSIX sh shim and
-# bin/manager is Oracle's real CAPOCI binary, carried as DATA at 0644. The
-# descriptor can declare only the executables it names (descriptor.go:170,
-# :204, :233) -- the controller plus one program per hook, five in this payload
-# -- and it has exactly one controller slot, so the manager cannot be declared
-# and must not arrive executable. That makes the executable-set check *stricter*
-# here, not looser: it still demands exactly that set and nothing besides, and a
-# separate check asserts that bin/manager is among the files that are not
-# executable. If a future edit
-# ever ships the manager at 0755, this workflow fails rather than publishing a
-# payload the installer would reject at layout validation.
+# Bar declares five executables where Foo declares four: it has a fourth hook,
+# ignition, because CAPOCI cannot stage an oversized bootstrap ignition
+# itself. Otherwise the layout checks are now identical, which they were not
+# before: Bar used to ship a POSIX sh shim at bin/controller with Oracle's real
+# manager carried alongside it as DATA at 0644, because the installer injected
+# a flag name CAPOCI does not accept and the descriptor had one controller
+# slot. spec.capi.controllerArgs ended that -- the payload names CAPOCI's own
+# flag, bin/controller is the manager, and the shim, its lint, its behaviour
+# test and the manager-is-data assertion are all gone.
 #
 # A second job, `verify-sources`, has no counterpart in the Foo payload. Bar
 # carries ~1,500 lines of hook shell that Foo does not, and the image is built
@@ -71,19 +69,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The hooks are bash; the shim is POSIX sh and is parsed as such,
-          # because the installer offers no guarantee that the host's /bin/sh
-          # is bash. A bashism in the shim would pass `bash -n` and then fail
-          # on a Debian host at the one moment the controller must start.
           for f in hooks/*.sh hooks/lib/common.sh; do bash -n "$f"; echo "bash -n  ${f}  OK"; done
-          dash -n shim/controller.sh && echo "dash -n  shim/controller.sh  OK"
 
           # The same shellcheck image the installer's hack/shellcheck.sh uses,
           # so a hook that passes here passes there too. -x follows the
           # `# shellcheck source=` directives into lib/common.sh.
           podman run --rm -v "${PWD}:/workdir:z" -w /workdir \
             --entrypoint sh quay.io/coreos/shellcheck-alpine:v0.5.0 \
-            -c 'shellcheck --format=gcc -x hooks/*.sh hooks/lib/common.sh shim/controller.sh'
+            -c 'shellcheck --format=gcc -x hooks/*.sh hooks/lib/common.sh'
           echo "shellcheck: clean"
 
       - name: YAML parses, and the manifest documents are single-object
@@ -182,47 +175,45 @@ jobs:
           sys.exit(rc)
           PY
 
-      # The two gaps this payload documents are both worked around in
-      # shim/controller.sh, so the shim's behaviour is asserted rather than
-      # described. Run against a stub manager, on the host, with no image and
-      # no cloud: the point is the argument translation and the execute bit,
-      # neither of which needs the real CAPOCI binary.
-      - name: The shim translates --health-addr and makes the manager runnable
+      # The flag mismatch that used to need a shim is now the payload's own
+      # declaration, so what is asserted here is the declaration rather than a
+      # wrapper's behaviour. No image and no cloud: it reads openshift.yaml.
+      - name: controllerArgs carries the installer's render tokens, exactly once
         run: |
           set -euo pipefail
-          root=$(mktemp -d)
-          mkdir -p "${root}/bin"
-          install -m 0755 shim/controller.sh "${root}/bin/controller"
+          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
+          python3 - <<'PY'
+          import sys, yaml
+          doc = yaml.safe_load(open("openshift.yaml"))
+          args = doc["spec"]["capi"]["controllerArgs"]
+          bad = False
 
-          # 0640 is what `oc image extract` leaves behind for a file the
-          # descriptor could not declare. Reproducing that mode exactly is the
-          # whole point of the test.
-          printf '#!/bin/sh\nprintf "%%s\\n" "$@"\n' > "${root}/bin/manager"
-          chmod 0640 "${root}/bin/manager"
+          # The installer renders these and a controller whose webhook does not
+          # match the one the installer installed fails late and obscurely, so
+          # the requirement is on the tokens, not on any particular flag name.
+          for token in ("{{.WebhookPort}}", "{{.WebhookCertDir}}"):
+              n = sum(a.count(token) for a in args)
+              if n != 1:
+                  print(f"::error::controllerArgs: {token} appears {n} times, expected 1")
+                  bad = True
 
-          got=$("${root}/bin/controller" \
-                  --health-addr=127.0.0.1:9440 \
-                  --webhook-port 9443 \
-                  --health-addr 127.0.0.1:9441 \
-                  -v 2 2>/dev/null)
-          want=$(printf '%s\n' --health-probe-bind-address=127.0.0.1:9440 \
-                   --webhook-port 9443 --health-probe-bind-address 127.0.0.1:9441 -v 2)
+          # Appended by the installer (pkg/clusterapi/system.go:703-705).
+          if any(a.split("=", 1)[0] == "--kubeconfig" for a in args):
+              print("::error::controllerArgs declares --kubeconfig, which the installer appends")
+              bad = True
 
-          if [ "${got}" != "${want}" ]; then
-            echo "::error::the shim did not translate the argument list as expected"
-            diff <(echo "${want}") <(echo "${got}") || true
-            exit 1
-          fi
-          echo "shim: --health-addr translated in both spellings, order and other flags preserved"
+          # The regression this payload exists to prevent. CAPOCI declares
+          # --health-probe-bind-address (main.go:100) and exits non-zero on an
+          # unknown flag (main.go:178-180); --health-addr is CAPA's spelling and
+          # is what the installer used to inject, which is what forced the shim.
+          if any(a.startswith("--health-addr") for a in args):
+              print("::error::controllerArgs declares --health-addr; CAPOCI wants "
+                    "--health-probe-bind-address and exits on an unknown flag")
+              bad = True
 
-          [ -x "${root}/bin/manager" ] || { echo "::error::shim did not add the execute bit"; exit 1; }
-          # 0640 + u+x = 0740. Owner-only, exactly as ApplyExecutableModes does
-          # for the declared paths: the group and other bits are untouched. A
-          # shim that widened the mode would be a finding of its own.
-          mode=$(stat -c '%a' "${root}/bin/manager")
-          [ "${mode}" = "740" ] || { echo "::error::manager mode is ${mode}, expected 740"; exit 1; }
-          echo "shim: manager made executable, mode ${mode}"
-          rm -rf "${root}"
+          print(f"controllerArgs: {len(args)} args, render tokens OK")
+          sys.exit(1 if bad else 0)
+          PY
 
   build:
     name: build and publish
@@ -324,22 +315,45 @@ jobs:
           python3 - "${root}" <<'PY' || rc=1
           import os, sys, yaml
           root = sys.argv[1]
-          spec = yaml.safe_load(open(os.path.join(root, "openshift.yaml")))
-          layout = spec["layout"]
-          paths = [("controller", layout["controller"], True),
-                   ("customResource", layout["customResource"], False),
-                   ("clusterTemplates", layout["clusterTemplates"], False),
-                   ("manifestTemplates", layout["manifestTemplates"], False)]
-          paths += [("hooks." + k, v["program"], True) for k, v in layout["hooks"].items()]
-          paths += [("metadata.yaml", "metadata.yaml", False)]
+          doc = yaml.safe_load(open(os.path.join(root, "openshift.yaml")))
           bad = False
+
+          if doc.get("kind") != "ExternalProviderPayload":
+              print(f"kind: {doc.get('kind')!r}, expected ExternalProviderPayload")
+              bad = True
+          # Must equal platform.external.platformName; the installer refuses the
+          # install if they differ, so an empty one is a payload nobody can use.
+          if not doc.get("metadata", {}).get("name"):
+              print("metadata.name: missing")
+              bad = True
+
+          spec = doc["spec"]
+          capi, ocp = spec["capi"], spec["openshift"]
+          paths = [("capi.controller", capi["controller"], True),
+                   ("capi.infrastructureComponents", capi["infrastructureComponents"], False),
+                   ("capi.clusterTemplates", capi["clusterTemplates"], False),
+                   ("openshift.manifestTemplates", ocp["manifestTemplates"], False)]
+          if "e2e" in capi:
+              paths += [("capi.e2e.program", capi["e2e"]["program"], True)]
+          paths += [("openshift.installerHooks." + k, v["program"], True)
+                    for k, v in ocp["installerHooks"].items()]
+          paths += [("metadata.yaml", "metadata.yaml", False)]
           for key, rel, must_exec in paths:
               full = os.path.join(root, rel)
               ok = os.path.exists(full)
               ex = ok and os.access(full, os.X_OK)
               if not ok or (must_exec and not ex):
                   bad = True
-              print(f"{key:22} {rel:38} {'OK' if ok else 'MISSING':8} exec={ex}")
+              print(f"{key:38} {rel:38} {'OK' if ok else 'MISSING':8} exec={ex}")
+
+          # ignition is the one phase that carries a second field, and the
+          # installer reads that file back. A payload that declares the hook and
+          # not the path is refused at validation.
+          ign = ocp["installerHooks"].get("ignition")
+          if ign is not None and not ign.get("bootstrapOutputPath"):
+              print("installerHooks.ignition: bootstrapOutputPath is required")
+              bad = True
+
           c = spec["compatibility"]["kubernetes"]
           print(f"compatibility: kubernetes {c['min']} - {c['max']}")
           sys.exit(1 if bad else 0)
@@ -349,13 +363,12 @@ jobs:
           #    rejects an executable the descriptor does not name, so an extra one
           #    is not harmless - it is a payload that fails to install.
           #
-          #    bin/manager is deliberately absent from this list. It is Oracle's
-          #    CAPOCI binary, carried as data at 0644 because the descriptor has
-          #    one controller slot and that slot holds the shim. Check 2b below
-          #    asserts that it stays non-executable; between them, the manager is
-          #    pinned on both sides and cannot drift into the declared set.
+          #    bin/controller is Oracle's CAPOCI manager, renamed. It used to be
+          #    a shim with the manager carried alongside it as non-executable
+          #    data; spec.capi.controllerArgs removed the need for both, so this
+          #    set is now exactly the declared one with no exception carved out.
           found=$(cd "${root}" && find . -type f -perm -u+x | sed 's|^\./||' | sort)
-          expected=$(printf '%s\n' bin/controller hooks/ignition-ready.sh \
+          expected=$(printf '%s\n' bin/controller hooks/ignition.sh \
                        hooks/infra-ready.sh hooks/post-provision.sh \
                        hooks/pre-destroy.sh | sort)
           if [ "${found}" != "${expected}" ]; then
@@ -366,41 +379,26 @@ jobs:
             echo "executables: 5, as declared"
           fi
 
-          # 2b. The manager is present and is NOT executable. Shipping it 0755
-          #     would make it an undeclared executable and the installer would
-          #     refuse the payload at layout validation (descriptor.go:233) -
-          #     a failure that would otherwise surface only at install time, on
-          #     a user's machine.
-          if [ ! -f "${root}/bin/manager" ]; then
-            echo "::error::bin/manager is missing; bin/controller is only a shim"
+          # 2b. No stray bin/manager. The shim is gone and so is the data copy
+          #     it chmod'd; a build that reintroduces one is shipping a second
+          #     controller the descriptor does not declare.
+          if [ -e "${root}/bin/manager" ]; then
+            echo "::error::bin/manager exists; the shim was removed and bin/controller is the manager"
             rc=1
-          elif [ -x "${root}/bin/manager" ]; then
-            echo "::error::bin/manager is executable; it must ship as data (0644)"
-            rc=1
-          else
-            echo "manager: present, mode $(stat -c '%a' "${root}/bin/manager"), not executable - correct"
           fi
 
           # 3. The installer runs the controller as a host process, not in a
           #    container, so it cannot rely on this image's libc.
           #
-          #    Unlike the Foo payload, the binary under test is bin/manager:
-          #    bin/controller is a shell script here and `file` would say so.
-          #    Checking the shim would pass vacuously and prove nothing about
-          #    the program that actually runs.
-          if file "${root}/bin/manager" | grep -q 'statically linked'; then
-            echo "manager: statically linked"
+          #    The binary under test is bin/controller, the same path the Foo
+          #    payload checks. While the shim existed this had to target
+          #    bin/manager instead, because bin/controller was a shell script
+          #    and `file` would have said so -- a vacuous pass.
+          if file "${root}/bin/controller" | grep -q 'statically linked'; then
+            echo "controller: statically linked"
           else
-            echo "::error::bin/manager is not statically linked"
-            file "${root}/bin/manager"
-            rc=1
-          fi
-          # And the shim really is POSIX-shell portable, not an ELF or a bashism
-          # carrier. It is the first thing the installer executes.
-          if head -c 2 "${root}/bin/controller" | grep -q '#!'; then
-            echo "controller: $(head -n 1 "${root}/bin/controller")"
-          else
-            echo "::error::bin/controller has no interpreter line"
+            echo "::error::bin/controller is not statically linked"
+            file "${root}/bin/controller"
             rc=1
           fi
 
@@ -478,7 +476,7 @@ jobs:
             echo '~~~'
             echo
             echo "bootstrapIgnitionStaging is required: this payload declares an"
-            echo "ignitionReady hook, and the install is refused without consent."
+            echo "ignition hook, and the install is refused without consent."
             echo "See README.md, \"The ignition offload, and the hook that declares it\"."
           } >> "${GITHUB_STEP_SUMMARY}"
         env:

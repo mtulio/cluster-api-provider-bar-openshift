@@ -18,10 +18,8 @@
 #       platformName: bar
 #       cloudControllerManager: External
 #       clusterAPI:
-#         name: bar
-#         controller:
-#           image:
-#             ref: quay.io/<you>/cluster-api-provider-bar-openshift@sha256:<digest>
+#         payloadImage: quay.io/<you>/cluster-api-provider-bar-openshift@sha256:<digest>
+#         bootstrapIgnitionStaging: Allowed
 #
 # The installer pulls this image, extracts it into capiInstallerPath (default
 # <install-dir>/capi-installer), validates the layout declared in
@@ -29,7 +27,7 @@
 # local process against its own ephemeral Cluster API control plane.
 #
 # This repository's root *is* the payload root, one file or directory per
-# layout key in openshift.yaml. Nothing is copied with `COPY . /`: each path
+# path openshift.yaml declares under spec. Nothing is copied with `COPY . /`: each path
 # is named explicitly below, so repository furniture -- README.md, .git,
 # CI configuration -- stays out of the image. Adding a file to the repository
 # does not add it to the payload.
@@ -134,24 +132,22 @@ ARG PROVIDER_IMAGE
 ARG PROVIDER_VERSION
 ARG PROVIDER_DIGEST
 
-# Two files where the Foo payload has one, and the reason is a gap rather than
-# a preference.
+# One file, exactly as the Foo payload ships one. Earlier revisions of this
+# image carried two: a POSIX sh shim at bin/controller and Oracle's manager at
+# bin/manager, shipped 0644 as DATA because the descriptor had a single
+# controller slot and the shim was in it.
 #
-# bin/controller is a shim: it translates the installer's --health-addr into
-# the --health-probe-bind-address CAPOCI declares, then execs the real manager.
-# bin/manager is Oracle's binary, shipped at 0644 -- as DATA, not as a program.
+# Both are gone. The shim existed only to translate the installer's injected
+# --health-addr into the --health-probe-bind-address CAPOCI declares
+# (main.go:100); spec.capi.controllerArgs now lets the payload name that flag
+# itself, so there is nothing to translate, nothing to chmod at run time, and
+# Oracle's binary is simply the declared controller.
 #
-# It has to be data. Only the four paths openshift.yaml declares may be
-# executable in a valid payload (descriptor.go:170, :204, :233), and the
-# descriptor has exactly one controller slot. Shipping the manager executable
-# would make it an undeclared executable and fail layout validation; the shim
-# restores its execute bit at run time instead.
-#
-# The 0644 here is also what keeps CI check 2 honest: `find -perm -u+x` over
-# the extracted tree must return exactly the four declared paths, the same
-# assertion the Foo payload makes, with no exception carved out for Bar.
-COPY --from=controller --chmod=0644 /manager /bin/manager
-COPY --chmod=0755 shim/controller.sh /bin/controller
+# Renamed on the way in. openshift.yaml declares `spec.capi.controller:
+# bin/controller`, a name that is the same for every provider, so the
+# installer's layout validation does not have to know that this one calls its
+# binary `manager`.
+COPY --from=controller --chmod=0755 /manager /bin/controller
 
 # Only the CustomResourceDefinitions and webhook configurations in the bundle
 # are ever applied: the installer runs the controller as an OS process, so the
@@ -165,7 +161,8 @@ COPY --from=assets --chmod=0644 /assets/metadata.yaml                  /metadata
 
 # The OpenShift-specific descriptor and clusterctl's own metadata.yaml are a
 # pair: metadata.yaml carries the Cluster API contract, openshift.yaml carries
-# the Kubernetes compatibility range and the layout map.
+# the Kubernetes compatibility range, the controller's command line and the
+# layout map.
 COPY openshift.yaml /openshift.yaml
 
 # Rendered by the installer with clusterctl substitution -- ${VAR},
@@ -185,7 +182,7 @@ COPY manifests/   /manifests/
 # ${OPENSHIFT_INSTALL_INFRA_ID}, ${OCI_REGION} and others as *shell* variables
 # at run time; substituting them at render time would destroy the scripts.
 #
-# Only the three hook programs are executable. lib/common.sh is sourced,
+# Only the four hook programs are executable. lib/common.sh is sourced,
 # never run, and layout validation rejects any executable the descriptor
 # does not declare -- so it is copied with the mode it has in the tree.
 COPY --chmod=0755 hooks/*.sh /hooks/

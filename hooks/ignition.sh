@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 #
-# ignitionReady hook for the Bar (OCI/CAPOCI) payload.
+# ignition hook for the Bar (OCI/CAPOCI) payload.
 #
-# Runs after the installer's ignition assets are final and BEFORE any Cluster
-# API object is applied, so no cloud infrastructure exists yet. It is the only
-# hook whose output the installer reads back.
+# Runs at the installer's IgnitionProvider point of extension: after the
+# Cluster reports its infrastructure ready, so the network and the load
+# balancers exist, and BEFORE any Machine is created, so no compute does. It
+# is the only hook whose output the installer reads back.
+#
+# Infrastructure existing by this point is what the hook needs: the bucket and
+# the pre-authenticated request below are created against the tenancy and the
+# compartment, not against anything a Machine would have brought.
 #
 # Why this payload needs it, and the Foo payload does not:
 #
@@ -45,7 +50,7 @@
 # shellcheck source=lib/common.sh
 # shellcheck disable=SC1091
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib/common.sh"
-expect_hook ignition-ready
+expect_hook ignition
 reject_args "$@"
 
 # ---------------------------------------------------------------------------
@@ -57,11 +62,11 @@ reject_args "$@"
 #
 # OPENSHIFT_INSTALL_HOOK_OUTPUT_DIR is a directory the installer creates for
 # this hook and removes after it returns. The descriptor's
-# layout.hooks.ignitionReady.bootstrapOutputPath is relative to it, and the
+# spec.openshift.installerHooks.ignition.bootstrapOutputPath is relative to it, and the
 # installer reads that path back once the hook exits 0.
 # ---------------------------------------------------------------------------
-: "${OPENSHIFT_INSTALL_BOOTSTRAP_IGNITION:?not set -- is this wired as the ignitionReady hook?}"
-: "${OPENSHIFT_INSTALL_HOOK_OUTPUT_DIR:?not set -- is this wired as the ignitionReady hook?}"
+: "${OPENSHIFT_INSTALL_BOOTSTRAP_IGNITION:?not set -- is this wired as the ignition hook?}"
+: "${OPENSHIFT_INSTALL_HOOK_OUTPUT_DIR:?not set -- is this wired as the ignition hook?}"
 
 # A payload variable, not an installer concept. The installer knows nothing
 # about buckets and must not: it holds no OCI credentials.
@@ -69,7 +74,7 @@ reject_args "$@"
 : "${OCI_REGION:?set it to the region the bucket lives in}"
 
 BOOTSTRAP_IGN=${OPENSHIFT_INSTALL_BOOTSTRAP_IGNITION}
-# Must match layout.hooks.ignitionReady.bootstrapOutputPath in openshift.yaml,
+# Must match spec.openshift.installerHooks.ignition.bootstrapOutputPath in openshift.yaml,
 # and must NOT be bootstrap.ign -- see rule 1 above.
 OUTPUT="${OPENSHIFT_INSTALL_HOOK_OUTPUT_DIR}/bootstrap-staged.ign"
 OBJECT_NAME="${INFRA_ID}/bootstrap.ign"
@@ -190,4 +195,4 @@ fi
 jq -e '.ignition.version' "${OUTPUT}" >/dev/null 2>&1 ||
 	die "${OUTPUT##*/} is not a parseable Ignition config"
 
-log "ignition-ready complete; the installer reads ${OUTPUT##*/} in place of its own bootstrap ignition"
+log "ignition complete; the installer reads ${OUTPUT##*/} in place of its own bootstrap ignition"

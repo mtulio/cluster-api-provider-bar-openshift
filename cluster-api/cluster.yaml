@@ -21,9 +21,17 @@
 # this directory, creates what it finds in its temporary local control plane,
 # and waits for Cluster.status.infrastructureReady.
 #
-# Rendered with clusterctl substitution. ${INSTALLER_INFRA_ID} is supplied by
-# the installer and is the run's infrastructure ID; the ${OCI_*} variables come
-# from platform.external.clusterAPI.variables in install-config.yaml.
+# Rendered with clusterctl substitution. INSTALLER_INFRA_ID is supplied by the
+# installer and is the run's infrastructure ID; the OCI_-prefixed variables
+# come from platform.external.clusterAPI.variables in install-config.yaml.
+#
+# DO NOT WRITE A SUBSTITUTION TOKEN -- a dollar sign followed by a braced name
+# -- ANYWHERE IN THIS FILE, INCLUDING A COMMENT. clusterctl substitution is
+# textual and does not parse YAML, so a comment is a substitution site like any
+# other line. This comment used to spell the OCI_ prefix as a braced token with
+# a wildcard, and the installer duly reported an unresolvable variable named
+# `OCI_` and refused the install at `create manifests`. Name variables in prose
+# without the sigil, as the paragraph above now does.
 #
 # THE CIDRs BELOW ARE DELIBERATELY NOT VARIABLES. The NSG rules further down
 # are written against these exact ranges, one rule at a time, because CAPOCI

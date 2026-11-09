@@ -23,13 +23,20 @@
 # on-disk file with a ~300-byte pointer config. By the time this Machine was
 # created, <infraID>-bootstrap held the pointer and the size problem was gone.
 #
-# That step is now the ignitionReady hook, declared in openshift.yaml and
-# implemented at hooks/ignition-ready.sh. It runs once the installer's
-# ignition assets are final and before any Cluster API object is applied --
-# so before this Machine exists -- and hands the installer a pointer config at
-# the descriptor's bootstrapOutputPath. The installer reads that file in place
-# of its own bootstrap ignition, and <infraID>-bootstrap therefore holds the
-# pointer by the time anything here is reconciled.
+# That step is now the ignition hook, declared in openshift.yaml and
+# implemented at hooks/ignition.sh. It runs at the installer's
+# IgnitionProvider point of extension: after the Cluster reports its
+# infrastructure ready, so the network and the load balancers exist, and
+# before any Machine is created -- so before this Machine exists. It hands the
+# installer a pointer config at the descriptor's bootstrapOutputPath. The
+# installer reads that file in place of its own bootstrap ignition, and
+# <infraID>-bootstrap therefore holds the pointer by the time anything here is
+# reconciled.
+#
+# Infrastructure existing by then is what makes the hook workable rather than
+# an inconvenience: the bucket and the pre-authenticated request it creates
+# need the tenancy and the compartment, not the compute this Machine
+# describes.
 #
 # Nothing in this manifest changes either way: the Machine references the
 # bootstrap Secret by name and does not care how large the document behind it

@@ -30,21 +30,27 @@ than its successes.
 
 ## The repository root is the payload root
 
-`openshift.yaml` declares a layout, and every path it declares is a file or directory in
-this repository. The installer extracts the image into `capiInstallerPath` (default
+`openshift.yaml` declares a layout under `spec`, and every path it declares is a file or
+directory in this repository. The installer extracts the image into `capiInstallerPath` (default
 `<install-dir>/capi-installer`) and validates that layout before it makes a single cloud
 call.
 
 | Path | `openshift.yaml` key | Where it comes from | Reaches the cluster? |
 | --- | --- | --- | --- |
-| `bin/controller` | `layout.controller` | **a shim in this repository** — see below | no — runs as a local installer process |
-| `bin/manager` | — (deliberately undeclared) | copied from Oracle's released CAPOCI image at build time, shipped **non-executable** | no |
-| `infrastructure-components.yaml` | `layout.customResource` | CAPOCI's release assets at build time | no — only its CRDs and webhooks are applied, to the local control plane |
+| `bin/controller` | `spec.capi.controller` | Oracle's released CAPOCI manager, copied out of their controller image at build time and renamed | no — runs as a local installer process |
+| `infrastructure-components.yaml` | `spec.capi.infrastructureComponents` | CAPOCI's release assets at build time | no — only its CRDs and webhooks are applied, to the local control plane |
 | `metadata.yaml` | — | CAPOCI's release assets at build time | no |
 | `openshift.yaml` | — | this repository | no |
-| `cluster-api/` | `layout.clusterTemplates` | this repository | **no** — applied to the installer's ephemeral control plane |
-| `manifests/` | `layout.manifestTemplates` | this repository | **yes** — folded into `<install-dir>/manifests/` |
-| `hooks/` | `layout.hooks.*` | this repository | no — run on the installer host |
+| `cluster-api/` | `spec.capi.clusterTemplates` | this repository | **no** — applied to the installer's ephemeral control plane |
+| `manifests/` | `spec.openshift.manifestTemplates` | this repository | **yes** — folded into `<install-dir>/manifests/` |
+| `hooks/` | `spec.openshift.installerHooks.<phase>.program` | this repository | no — run on the installer host |
+
+One key in `spec.capi` declares no path: `controllerArgs` is the controller's **whole**
+command line, which the payload owns rather than contributes to. On this payload it is the
+key that removed a file — see below. The installer renders `{{.WebhookPort}}`,
+`{{.WebhookCertDir}}` and `{{suggestHealthHostPort}}` into it and appends `--kubeconfig`;
+everything else is the provider's to declare. A cluster creator who needs one more flag
+adds it with `clusterAPI.controllerExtraArgs`, which is appended after this list.
 
 The three build-time files are not committed. They are fetched by the `Containerfile`,
 pinned by image digest and SHA-256, and a build that cannot reproduce those digests fails.
@@ -55,44 +61,44 @@ rather than one rendered directory. `manifests/` has one further constraint `clu
 does not: the bootstrap node counts documents in each extra manifest and rejects a
 multi-document file, so every file there holds exactly one object. CI enforces it.
 
-## The shim is a gap
+## The shim was a gap, and the gap is closed
 
-`bin/controller` is **not** the CAPOCI manager. It is a 60-line POSIX `sh` script
-([`shim/controller.sh`](shim/controller.sh)) that does two things and then `exec`s the real
-binary. Both are workarounds.
+**This payload used to ship a shim at `bin/controller` and it no longer does.** The finding
+that produced it is recorded here because it is what changed the contract, and because a
+payload author hitting the same wall should be able to recognise it.
 
-**One: a flag the installer passes and CAPOCI does not accept.** The installer starts the
-provider controller with a fixed flag set including `--health-addr=<host:port>`, then polls
-`/healthz` at exactly that address. CAPOCI declares the controller-runtime spelling,
-`--health-probe-bind-address`, folds the stdlib flag set into pflag and calls
-`pflag.Parse()` — which exits non-zero on an unknown flag. The controller does not start at
-all. The flag cannot simply be dropped either: a controller healthy on some other port is,
-to the installer, a controller that never came up. Every other flag the installer passes
-(`--webhook-port`, `--webhook-cert-dir`, `-v`) CAPOCI already accepts, so this is one
-translation.
+**The finding.** The installer started the provider controller with a *fixed* flag set
+including `--health-addr=<host:port>`, then polled `/healthz` at exactly that address.
+CAPOCI declares the controller-runtime spelling, `--health-probe-bind-address`
+([`main.go:100`](https://github.com/oracle/cluster-api-provider-oci/blob/main/main.go)),
+folds the stdlib flag set into pflag and calls `pflag.Parse()` — which exits non-zero on an
+unknown flag. The controller did not start at all. The flag could not simply be dropped
+either: a controller healthy on some other port is, to the installer, a controller that
+never came up. And the installer's list was *appended to*, never replaced, so no amount of
+configuration could remove the wrong spelling.
 
-**Two: the manager cannot be made executable any other way.** A payload may declare only
-the executables it names — `layout.controller` plus its hooks, five of them here — and layout validation
-*rejects* an executable the payload did not declare. `oc image extract` writes every file
-`0640`, and the installer restores the execute bit only for the declared four. The
-descriptor has one controller slot and the shim is in it, so Oracle's binary ships as
-**data** at `0644` and the shim chmods it at run time. There is no loader-based escape:
-CAPOCI is built `CGO_ENABLED=0` with `-extldflags '-static'`, so `ld.so ./manager` is not
-available.
+**Why that cost a second file too.** A payload may declare only the executables it names,
+and layout validation *rejects* an executable the payload did not declare. The descriptor
+had one controller slot and the wrapper was in it, so Oracle's binary had to ship as
+**data** at `0644` and be `chmod`'d at run time. There was no loader-based escape: CAPOCI
+is built `CGO_ENABLED=0` with `-extldflags '-static'`, so `ld.so ./manager` is not
+available. One mismatched flag name therefore produced a wrapper script, a non-executable
+binary and a CI check to keep the two honest.
 
-Three candidate first-class fixes, any one of which removes this file:
+**The fix.** `spec.capi.controllerArgs` — the payload declares the controller's whole
+command line, and the installer renders its three tokens into it rather than injecting
+flags of its own. This payload now names `--health-probe-bind-address={{suggestHealthHostPort}}`
+directly, `bin/controller` *is* Oracle's manager, and `shim/`, `bin/manager` and the shim's
+CI job are all gone. It is also what every *integrated* provider already does: Nutanix
+declares `--health-probe-bind-address` where AWS declares `--health-addr`
+(`pkg/clusterapi/system.go:381` and `:345`), so the external path was the odd one out.
 
-1. A descriptor field naming the controller's health-probe flag, so the installer passes
-   the spelling the provider actually declares.
-2. Let a payload declare additional executables, so the manager can be `layout.controller`
-   directly.
-3. Make the installer's controller argument list overridable from `clusterAPI`.
-
-This matters beyond OCI. The enhancement proposal currently answers the "what if the
-provider's flags differ" question with *"the partner ships a wrapper script"* — which is
-true in local-path mode and **not sufficient in image mode**, because the declared-executable
-rule makes the wrapper and the wrapped binary compete for the one controller slot. The shim works, and it
-should not have to exist.
+Two things worth keeping from the episode. First, the problem was invisible in local-path
+mode and only bit in image mode, because that is where the declared-executable rule makes
+the wrapper and the wrapped binary compete for the one controller slot — a reminder that
+the packaging mode is part of the contract, not a detail of it. Second, "the partner ships
+a wrapper script" was the enhancement proposal's own answer to *"what if the provider's
+flags differ"*, and it was wrong; this repository is where that was found out.
 
 ## The ignition offload, and the hook that declares it
 
@@ -116,21 +122,24 @@ window between `create ignition-configs` and `create cluster`. That worked only 
 the asset store re-reads a changed file from disk across process boundaries — shared
 behaviour every platform relies on, which is a poor thing to build a partner contract on.
 
-`ignitionReady` turns that wrapper into a declared phase. It runs once the ignition assets
-are final and **before any Cluster API object is applied**, so no cloud infrastructure
-exists yet, and it is the only hook whose output the installer reads back. Two properties
+`ignition` turns that wrapper into a declared phase. It is named for the installer's
+`IgnitionProvider` point of extension, which is where the integrated providers stage an
+oversized bootstrap ignition too, and it runs there: **after the Cluster reports its
+infrastructure ready and before any Machine is created**. The network and the load
+balancers exist by then; no compute does. It is the only hook whose output the installer
+reads back. Two properties
 are deliberate and this payload depends on both:
 
 - **The installer's `bootstrap.ign` is never touched.** The hook writes
   `bootstrap-staged.ign` into a directory the installer creates for it, named by
-  `layout.hooks.ignitionReady.bootstrapOutputPath`, and that name may not collide with the
+  `spec.openshift.installerHooks.ignition.bootstrapOutputPath`, and that name may not collide with the
   installer's own artifact.
 - **The phase is gated.** `platform.external.clusterAPI.bootstrapIgnitionStaging` must be
   `Allowed`. This is the only hook handed the cluster's day-0 secret material — the MCS TLS
   key, a CA key, the pull secret, the kubeadmin hash — so consent belongs to the cluster
   creator rather than to the payload.
 
-`hooks/ignition-ready.sh` is the implementation. It logs the ignition's size and SHA-256 and
+`hooks/ignition.sh` is the implementation. It logs the ignition's size and SHA-256 and
 never its content, records the bucket and object name *before* uploading so a run that dies
 mid-way still leaves `preDestroy` something to clean up, and stores the pre-authenticated
 request's **OCID and never its URL** — the OCID is an identifier, the URL is a bearer
@@ -148,9 +157,9 @@ Be precise about this; the two arms prove different things.
 | --- | --- |
 | A payload image can be built from a provider's own published release artifacts, with no clone and no compiler | **proven** — this repository builds from an image digest and two SHA-256-pinned assets |
 | The layout contract is expressible for a provider the installer has never heard of | **proven** — `openshift.yaml` here describes CAPOCI with no installer change |
-| The installer can start a controller it does not ship | **not yet run end to end for CAPOCI.** Blocked on installer support for `ignitionReady`, not by anything in the contract |
+| The installer can start a controller it does not ship | **payload validated through `create manifests`; not yet run end to end for CAPOCI.** The installer implements the `ignition` phase, so the contract is no longer the blocker |
 | `platform: external` + CAPI can install a cluster on OCI | **proven by the pilot, not by this payload.** The pilot ran from local paths with an out-of-band ignition offload |
-| The hooks in this repository do what they claim on real OCI | **proven as pilot code, except one.** Every comment marked `MEASURED` records a real run, and none has been re-run from inside a payload image. `hooks/ignition-ready.sh` is the exception: it is a port of the pilot's wrapper into the hook contract and **has never been run in either form from this repository** |
+| The hooks in this repository do what they claim on real OCI | **proven as pilot code, except one.** Every comment marked `MEASURED` records a real run, and none has been re-run from inside a payload image. `hooks/ignition.sh` is the exception: it is a port of the pilot's wrapper into the hook contract and **has never been run in either form from this repository** |
 | The image carries no credential and nothing tenancy-specific | **proven, and checked in CI on every build** |
 
 Everything carried over from the pilot is marked in place. Where a claim could not be
@@ -202,10 +211,17 @@ platform:
     platformName: bar
     cloudControllerManager: External
     clusterAPI:
-      name: bar
-      controller:
-        image:
-          ref: quay.io/<you>/cluster-api-provider-bar-openshift@sha256:<digest>
+      payloadImage: quay.io/<you>/cluster-api-provider-bar-openshift@sha256:<digest>
+      # Consent to the payload's ignition hook, the only hook handed the
+      # cluster's day-0 secret material. A payload that declares it while this
+      # is absent is refused at PreProvision -- before the local control plane
+      # starts and before any cloud resource is created -- and again at the
+      # handover itself.
+      #
+      # `create manifests` resolves the payload earlier without consulting this
+      # field, so it accepts a non-consenting install-config and `create
+      # cluster` is where the refusal lands. Nothing is spent in between.
+      bootstrapIgnitionStaging: Allowed
       variables:
         OCI_COMPARTMENT_ID: ocid1.compartment.oc1..CHANGE-ME
         OCI_REGION: us-ashburn-1
@@ -368,14 +384,12 @@ ls -la "$root"
 # 2. exactly the declared executables, and no others
 find "$root" -type f -perm -u+x
 
-# 2b. ...and the manager is NOT among them. Shipping it executable makes it an
-#     undeclared executable and the installer refuses the payload.
-test ! -x "$root/bin/manager" && echo "manager is data, as required"
-
-# 3. the manager is statically linked — the installer runs it on the host, not
-#    in a container, so it cannot rely on the image's libc. Check the manager,
-#    not bin/controller: that one is a shell script and would pass vacuously.
-file "$root/bin/manager"          # must say "statically linked"
+# 3. the controller is statically linked — the installer runs it on the host,
+#    not in a container, so it cannot rely on the image's libc. bin/controller
+#    is Oracle's manager, renamed; before the shim was removed this check had
+#    to target bin/manager instead, because bin/controller was a shell script
+#    and would have passed vacuously.
+file "$root/bin/controller"       # must say "statically linked"
 
 # 4. no credentials, nothing tenancy-specific. An OCID names one tenancy,
 #    compartment or subnet; a payload carrying one is not generic, even though
@@ -387,8 +401,8 @@ grep -rIoE 'BEGIN [A-Z ]*PRIVATE KEY|ssh-(rsa|ed25519|dss)|AKIA[0-9A-Z]{16}|ocid
 Check 4 prints matches by design — run it on an image you built, never paste its output
 anywhere. CI runs the same patterns but reports **counts and filenames only**.
 
-All of these run in CI on every pull request, plus the shim and template checks below. Run
-them locally before you open one.
+All of these run in CI on every pull request, plus the template checks below. Run them
+locally before you open one.
 
 ## Continuous integration
 
@@ -396,9 +410,7 @@ them locally before you open one.
 
 `verify-sources` needs no image and no registry permission:
 
-- `bash -n` over the hooks and `dash -n` over the shim — the shim is POSIX `sh`, because
-  nothing guarantees the installer host's `/bin/sh` is bash, and a bashism there fails at
-  the one moment the controller must start.
+- `bash -n` over the hooks.
 - `shellcheck`, in the same container image the installer's own `hack/shellcheck.sh` uses.
 - Every YAML parses; every file in `manifests/` holds exactly one object.
 - **Every `${...}` token belongs to the `INSTALLER_` or `OCI_` namespace.** The renderer
@@ -409,9 +421,9 @@ them locally before you open one.
 - **An embedded base64 script matches the plaintext reproduced above it.** Editing the
   readable copy and not the encoded one is silent: the manifest stays valid and the node
   runs the old script.
-- **The shim translates `--health-addr` in both spellings** and makes a `0640` manager
-  executable at `0740`, owner-only. Run against a stub manager, so no image and no cloud are
-  needed.
+- **`spec.capi.controllerArgs` carries each render token exactly once** and does not
+  declare `--kubeconfig`, which the installer appends itself. Parsed from the descriptor,
+  so no image and no cloud are needed.
 
 `build` builds the image, runs the "Before you publish" checks against the extracted tree,
 and publishes to GitHub Container Registry:
@@ -445,9 +457,8 @@ you intend to keep.
   process and ephemeral. Its objects, and especially its Secrets, never reach the installed
   cluster.
 - **No repository furniture.** The `Containerfile` names each path explicitly rather than
-  copying `.`, so adding a file here does not add it to the payload. `README.md`, `LICENSE`,
-  `shim/`, `.github/` and `.git` are all outside the image — `shim/controller.sh` is copied
-  in as `bin/controller`, the directory itself is not.
+  copying `.`, so adding a file here does not add it to the payload. `README.md`,
+  `LICENSE`, `.github/` and `.git` are all outside the image.
 
 ## License
 

@@ -4,9 +4,10 @@
 # half is clusterctl's own metadata.yaml, which sits next to this file at the
 # payload root and is fetched verbatim from the provider's release assets by
 # the Containerfile. metadata.yaml answers "which Cluster API contract does this
-# provider release implement"; it says nothing about Kubernetes versions and
-# nothing about where the controller binary or the hooks live, because neither
-# concept exists upstream. That residue is what this file carries.
+# provider release implement"; it says nothing about Kubernetes versions,
+# nothing about where the controller binary or the hooks live, and nothing
+# about the controller's command line, because none of those concepts exist
+# upstream. That residue is what this file carries.
 #
 # Everything here describes structure. The installer validates that the
 # declared layout is present and that the compatibility range admits the
@@ -20,137 +21,212 @@
 # this payload is the only demonstration that a provider the installer has
 # never heard of can provision a cluster.
 apiVersion: external.openshift.io/v1alpha1
-kind: ProviderPayload
+kind: ExternalProviderPayload
 
-# Compared against the Kubernetes version of the release payload being
-# installed. Outside this range the install is refused, before any cloud call.
-#
-# Only 1.36 (OpenShift 5.1) is exercised here. The wider band below illustrates
-# the shape of the contract; it is not a tested claim, and a provider
-# publishing a real payload is asserting something their own release process
-# has verified. CAPOCI v0.24.2 builds against Cluster API v1.11 and states no
-# Kubernetes range of its own, which is precisely the gap this field fills.
-compatibility:
-  kubernetes:
-    min: "1.33"
-    max: "1.37"
+metadata:
+  # Required, and must equal platform.external.platformName in
+  # install-config.yaml -- the install is refused if the two differ. Binding
+  # them is what makes a payload install attributable: platformName is the
+  # value that reaches Infrastructure.status.platformStatus.external, so the
+  # cluster carries a record of which provider installed it.
+  name: bar
 
-# Paths are relative to capiInstallerPath -- the directory the payload is
-# extracted into, which defaults to <install-dir>/capi-installer. A conforming
-# payload therefore needs no path configuration in install-config.yaml at all.
-#
-# Validation is exhaustive: every declared path must exist, the controller must
-# be executable, and an executable the payload did not declare is rejected. An
-# undeclared helper script is not "extra", it is a payload that fails to
-# install.
-layout:
-  # NOT the CAPOCI manager. This is a POSIX sh shim, shipped from shim/
-  # controller.sh in this repository, which translates the installer's
-  # --health-addr into the --health-probe-bind-address that CAPOCI declares
-  # (main.go:100) and then execs bin/manager. Without the translation CAPOCI
-  # exits immediately on an unknown flag, because main.go:178-180 folds the
-  # stdlib flags into pflag and calls pflag.Parse().
+  # Optional, informational, never read to decide behaviour. Build provenance
+  # belongs in the image's own OCI labels -- this Containerfile sets
+  # org.opencontainers.image.source and .version -- and these are the
+  # declarative fallback for a provider that does not. They are written to the
+  # install log, so they must carry no credential.
   #
-  # bin/manager -- the real controller, copied out of Oracle's released image
-  # -- is deliberately NOT declared and NOT shipped executable, because only
-  # the four paths named in this file may be executable in a valid payload
-  # (descriptor.go:170, :204, :233). The shim restores its execute bit at run
-  # time.
-  #
-  # Read shim/controller.sh before copying this pattern. It is a workaround for
-  # a gap in the contract, not an idiom: a payload author should not have to
-  # make a provider's own binary runnable from a script. README.md, "The shim
-  # is a gap", lists the three candidate first-class fixes.
-  controller: bin/controller
+  # Keep the revision in step with PROVIDER_VERSION in the Containerfile.
+  labels:
+    capi.provider.repo: https://github.com/oracle/cluster-api-provider-oci
+    capi.provider.revision: v0.24.2
 
-  # A single file, not a directory. Every clusterctl provider already publishes
-  # exactly one infrastructure-components.yaml.
+spec:
+  # Compared against the Kubernetes version this installer binary was built
+  # against. Outside this range the install is refused, before any cloud call.
   #
-  # Only its CustomResourceDefinitions and webhook configurations are applied:
-  # the installer runs the controller as a local OS process, so the Namespace,
-  # RBAC, Deployment and credentials Secret the bundle also contains are never
-  # applied to the local control plane. The capoci-auth-config Secret the
-  # bundle declares is inert here, and carries clusterctl placeholders rather
-  # than values -- the OCIClusterIdentity in cluster-api/cluster.yaml names a
-  # Secret the operator creates instead, so this image holds no credential of
-  # any kind.
-  customResource: infrastructure-components.yaml
+  # Only 1.36 (OpenShift 5.1) is exercised here. The wider band below
+  # illustrates the shape of the contract; it is not a tested claim, and a
+  # provider publishing a real payload is asserting something their own release
+  # process has verified. CAPOCI v0.24.2 builds against Cluster API v1.11 and
+  # states no Kubernetes range of its own, which is precisely the gap this
+  # field fills.
+  compatibility:
+    kubernetes:
+      min: "1.33"
+      max: "1.37"
 
-  # Cluster API objects -- Cluster, OCICluster, OCIClusterIdentity, Machine,
-  # OCIMachine -- applied to the installer's local, ephemeral Cluster API
-  # control plane. Nothing in this tree reaches the installed cluster.
-  clusterTemplates: cluster-api/
-
-  # Day-0 manifests folded into <install-dir>/manifests/ and applied by
-  # bootstrap: the Oracle cloud-controller-manager and the OCI CSI driver,
-  # which a platform: external cluster does not get from the release payload.
-  # These do reach the installed cluster. A different destination and a
-  # different lifetime from clusterTemplates above, which is why the two are
-  # separate keys rather than one rendered directory.
+  # Everything Cluster API needs to run this provider. Paths are relative to
+  # capiInstallerPath -- the directory the payload is extracted into, which
+  # defaults to <install-dir>/capi-installer. A conforming payload therefore
+  # needs no path configuration in install-config.yaml at all.
   #
-  # Each file holds exactly one object: the installer counts documents in an
-  # extra manifest and rejects a multi-document file
-  # (pkg/asset/manifests/openshift.go:426). clusterTemplates has no such limit.
-  manifestTemplates: manifests/
-
-  # Four phase scripts over a shared, non-executable lib/common.sh. The Foo
-  # payload makes the same split and declares three of the four; the OCI pilot
-  # used one script dispatching on OPENSHIFT_INSTALL_HOOK, which works equally
-  # well. What is not optional is declaring every executable: layout validation
-  # rejects an executable the descriptor does not name, which is why
-  # hooks/lib/common.sh is sourced rather than run and ships without an execute
-  # bit.
-  #
-  # Every entry is an object rather than a bare path, so the map has one shape
-  # whether or not a phase needs a second field. Only ignitionReady needs one
-  # today.
-  #
-  # Hooks are copied verbatim, never rendered. These scripts expand
-  # ${OPENSHIFT_INSTALL_INFRA_ID}, ${OCI_REGION} and others as *shell*
-  # variables at run time; substituting them at render time would destroy them.
-  hooks:
-    # Conditional, and most payloads will not declare it. Foo does not: CAPA
-    # stages an oversized bootstrap ignition inside its own controller, via
-    # AWSCluster.spec.s3Bucket, entirely downstream of anything the installer
-    # reads. CAPOCI has no equivalent -- it base64-encodes machine user data
-    # into instance metadata (cloud/scope/machine.go:353) and OCI caps that
-    # metadata at 32,000 bytes. The cap is an OCI SERVICE limit rather than a
-    # check in the provider, so the failure surfaces from the cloud API with a
-    # message about metadata size and nothing that mentions Ignition.
+  # Validation is exhaustive: every declared path must exist, the controller
+  # must be executable, and an executable the payload did not declare is
+  # rejected. An undeclared helper script is not "extra", it is a payload that
+  # fails to install.
+  capi:
+    # Oracle's real CAPOCI manager, copied out of their released controller
+    # image and renamed on the way in. The name is the same for every provider,
+    # so layout validation does not have to know that this one calls its binary
+    # `manager`.
     #
-    # Declaring this hook requires the cluster creator's consent:
-    # platform.external.clusterAPI.bootstrapIgnitionStaging must be Allowed,
-    # or the install is refused at validation before any cloud call. It is the
-    # only hook handed the cluster's day-0 secret material.
-    ignitionReady:
-      program: hooks/ignition-ready.sh
-      # The file the installer reads back, relative to a directory it creates
-      # for the hook and removes afterwards. The partner names the file; the
-      # installer decides where it lives.
+    # THIS USED TO BE A SHIM, and the shim is gone. The pilot's payload could
+    # not point this at the manager: the installer injected --health-addr,
+    # CAPOCI declares --health-probe-bind-address (main.go:100), pflag exits
+    # non-zero on an unknown flag (main.go:178-180), and an appended argument
+    # cannot remove an injected one. The workaround was a POSIX sh wrapper at
+    # bin/controller that translated the flag and chmod'd the manager -- which
+    # also forced the manager to ship as non-executable data, because the
+    # descriptor had one controller slot and the wrapper was in it.
+    #
+    # controllerArgs below removes the whole problem: the payload names CAPOCI's
+    # own flag and the installer renders the value into it, which is what every
+    # integrated provider already does (pkg/clusterapi/system.go:381). The
+    # wrapper was a finding against the contract, and the contract changed.
+    controller: bin/controller
+
+    # The controller's whole command line, not an addition to one. The pilot
+    # injected a fixed list from inside the installer and appended the
+    # provider's; append cannot remove, which is the entire reason the shim
+    # above existed. The payload now owns the list outright.
+    #
+    # The {{...}} tokens are rendered by the installer before exec, which is
+    # how a payload declares a flag whose value only the installer knows.
+    # {{.WebhookPort}} and {{.WebhookCertDir}} are each required exactly once;
+    # {{suggestHealthHostPort}} is optional, and omitting it means the
+    # installer does not poll /healthz. --kubeconfig is appended by the
+    # installer and must not be declared here.
+    #
+    # This is exactly the set the pilot ran with -- the four flags the
+    # installer injected, with --health-addr spelled the way CAPOCI spells it
+    # instead of translated by a wrapper. Nothing has been added:
+    # --init-oci-clients-on-startup is left at its default of true
+    # (main.go:153-158), which is what every measured run used, because the
+    # OCIClusterIdentity in cluster-api/cluster.yaml supplies credentials
+    # before the first reconcile.
+    controllerArgs:
+    - -v=2
+    - --health-probe-bind-address={{suggestHealthHostPort}}
+    - --webhook-port={{.WebhookPort}}
+    - --webhook-cert-dir={{.WebhookCertDir}}
+
+    # A single file, not a directory. Every clusterctl provider already
+    # publishes exactly one infrastructure-components.yaml.
+    #
+    # Only its CustomResourceDefinitions and webhook configurations are
+    # applied: the installer runs the controller as a local OS process, so the
+    # Namespace, RBAC, Deployment and credentials Secret the bundle also
+    # contains are never applied to the local control plane. The
+    # capoci-auth-config Secret the bundle declares is inert here, and carries
+    # clusterctl placeholders rather than values -- the OCIClusterIdentity in
+    # cluster-api/cluster.yaml names a Secret the operator creates instead, so
+    # this image holds no credential of any kind.
+    infrastructureComponents: infrastructure-components.yaml
+
+    # Cluster API objects -- Cluster, OCICluster, OCIClusterIdentity, Machine,
+    # OCIMachine -- applied to the installer's local, ephemeral Cluster API
+    # control plane. Nothing in this tree reaches the installed cluster.
+    clusterTemplates: cluster-api/
+
+    # spec.capi.e2e is deliberately absent. It is reserved in the API for a
+    # payload to declare its own test entry point, but every declared path must
+    # exist and this payload ships no bin/e2e -- declaring one it does not have
+    # would fail layout validation. Nothing in the install depends on it.
+
+  # What the OpenShift installer does beyond Cluster API. A consumer that is not
+  # the installer reads manifestTemplates and ignores installerHooks, which is
+  # why the hooks carry the consumer in their name.
+  openshift:
+    # Day-0 manifests folded into <install-dir>/manifests/ and applied by
+    # bootstrap: the Oracle cloud-controller-manager and the OCI CSI driver,
+    # which a platform: external cluster does not get from the release payload.
+    # These do reach the installed cluster. A different destination and a
+    # different lifetime from capi.clusterTemplates above, which is why the two
+    # are separate keys rather than one rendered directory.
+    #
+    # Each file holds exactly one object: the installer counts documents in an
+    # extra manifest and rejects a multi-document file
+    # (pkg/asset/manifests/openshift.go:426). clusterTemplates has no such
+    # limit.
+    manifestTemplates: manifests/
+
+    # Four phase scripts over a shared, non-executable lib/common.sh. The Foo
+    # payload makes the same split and declares three of the four; the OCI
+    # pilot used one script dispatching on OPENSHIFT_INSTALL_HOOK, which works
+    # equally well. What is not optional is declaring every executable: layout
+    # validation rejects an executable the descriptor does not name, which is
+    # why hooks/lib/common.sh is sourced rather than run and ships without an
+    # execute bit.
+    #
+    # Every entry is an object rather than a bare path, so the map has one
+    # shape whether or not a phase needs a second field. Only ignition
+    # needs one today.
+    #
+    # Hooks are copied verbatim, never rendered. These scripts expand
+    # ${OPENSHIFT_INSTALL_INFRA_ID}, ${OCI_REGION} and others as *shell*
+    # variables at run time; substituting them at render time would destroy
+    # them.
+    installerHooks:
+      # Conditional, and most payloads will not declare it. Foo does not: CAPA
+      # stages an oversized bootstrap ignition inside its own controller, via
+      # AWSCluster.spec.s3Bucket, entirely downstream of anything the installer
+      # reads. CAPOCI has no equivalent -- it base64-encodes machine user data
+      # into instance metadata (cloud/scope/machine.go:353) and OCI caps that
+      # metadata at 32,000 bytes. Because the encoding happens before the cap
+      # applies, the effective ceiling is nearer 24,000 bytes of Ignition. The
+      # cap is an OCI SERVICE limit rather than a check in the provider, so the
+      # failure surfaces from the cloud API with a message about metadata size
+      # and nothing that mentions Ignition.
       #
-      # It must NOT be named bootstrap.ign. That name belongs to the
-      # installer's own output, which this hook never touches, and two files
-      # with one name would leave no way to tell which of them a later step
-      # consumed.
-      #
-      # After the hook returns the installer reads this path, refuses the
-      # install if it is absent or does not parse as an Ignition config, and
-      # logs only its size and SHA-256.
-      bootstrapOutputPath: bootstrap-staged.ign
-    # Creates api/api-int DNS; adds the 22623 listener and its backend set to
-    # the API load balancer, which CAPOCI has no field for; and writes the CCM
-    # and CSI config, whose inputs are OCIDs that do not exist until Cluster
-    # API has built the network -- which is why they cannot be day-0 manifests.
-    infraReady:
-      program: hooks/infra-ready.sh
-    # Publishes *.apps, and fills the 22623 backend set infraReady created --
-    # which means naming control-plane addresses, so it cannot happen until
-    # the machines have booted.
-    postProvision:
-      program: hooks/post-provision.sh
-    # Removes everything the other three created, including the staged
-    # ignition object and the pre-authenticated request over it. None of it is
-    # owned by a Cluster API object, so deleting the Cluster would leave all
-    # of it behind.
-    preDestroy:
-      program: hooks/pre-destroy.sh
+      # Declaring this hook requires the cluster creator's consent:
+      # platform.external.clusterAPI.bootstrapIgnitionStaging must be Allowed,
+      # or the install is refused at PreProvision -- before the local control
+      # plane starts and before any cloud resource is created -- and again at
+      # the handover itself. `create manifests` reads this descriptor earlier
+      # and does not check the field, so that command accepts a non-consenting
+      # install-config and `create cluster` is where it fails. It is the only
+      # hook handed the cluster's day-0 secret material.
+      ignition:
+        program: hooks/ignition.sh
+        # The file the installer reads back, relative to a directory it creates
+        # for the hook and removes afterwards. The partner names the file; the
+        # installer decides where it lives. It is declared rather than fixed so
+        # that the installer has a name to validate and a name to put in a
+        # failure message.
+        #
+        # It must NOT be named bootstrap.ign. That name belongs to the
+        # installer's own output, which this hook never touches, and two files
+        # with one name would leave no way to tell which of them a later step
+        # consumed.
+        #
+        # The installer reads this path back because it owns the Secret the
+        # provider reads from: a bootstrap Machine gets its data through
+        # spec.bootstrap.dataSecretName, cluster-api/machines/10_bootstrap.yaml
+        # names ${INSTALLER_INFRA_ID}-bootstrap, and only the installer creates
+        # that Secret. The staged bytes have no other route to CAPOCI.
+        #
+        # It refuses the install if the file is absent, if it does not parse as
+        # an Ignition config, or if its SHA-256 equals the input's -- the last
+        # catches a hook that fails silently and copies its input, which would
+        # otherwise put the full ignition back into the Secret and fail at the
+        # OCI API far from the cause. Only size and SHA-256 are logged.
+        bootstrapOutputPath: bootstrap-staged.ign
+      # Creates api/api-int DNS; adds the 22623 listener and its backend set to
+      # the API load balancer, which CAPOCI has no field for; and writes the CCM
+      # and CSI config, whose inputs are OCIDs that do not exist until Cluster
+      # API has built the network -- which is why they cannot be day-0 manifests.
+      infraReady:
+        program: hooks/infra-ready.sh
+      # Publishes *.apps, and fills the 22623 backend set infraReady created --
+      # which means naming control-plane addresses, so it cannot happen until
+      # the machines have booted.
+      postProvision:
+        program: hooks/post-provision.sh
+      # Removes everything the other three created, including the staged
+      # ignition object and the pre-authenticated request over it. None of it is
+      # owned by a Cluster API object, so deleting the Cluster would leave all
+      # of it behind.
+      preDestroy:
+        program: hooks/pre-destroy.sh

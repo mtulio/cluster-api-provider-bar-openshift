@@ -12,7 +12,7 @@
 #
 # THE FILES
 #
-#   hooks/ignition-ready.sh   stages the oversized bootstrap ignition
+#   hooks/ignition.sh         stages the oversized bootstrap ignition
 #   hooks/infra-ready.sh      DNS, the 22623 listener, the CCM/CSI Secrets
 #   hooks/post-provision.sh   the *.apps record and the MCS backends
 #   hooks/pre-destroy.sh      removes what the other three created
@@ -26,7 +26,7 @@
 # adjacent on the page. Keep them in step by hand; pre-destroy.sh is the one
 # that gets forgotten.
 #
-# Foo declares three of these. ignition-ready.sh is the one CAPA does not
+# Foo declares three of these. ignition.sh is the one CAPA does not
 # need, because CAPA stages an oversized ignition inside its own controller.
 #
 #
@@ -56,7 +56,7 @@
 # The installer sets these before exec'ing a hook
 # (pkg/infrastructure/external/hooks/hooks.go):
 #
-#   OPENSHIFT_INSTALL_HOOK            ignition-ready | infra-ready |
+#   OPENSHIFT_INSTALL_HOOK            ignition | infra-ready |
 #                                     post-provision | pre-destroy
 #   OPENSHIFT_INSTALL_INFRA_ID        the run's infrastructure ID
 #   OPENSHIFT_INSTALL_CLUSTER_DOMAIN  e.g. mycluster.example.com
@@ -68,7 +68,7 @@
 #   OPENSHIFT_INSTALL_INFRA_JSON      PATH to the rendered infrastructure object
 #   OPENSHIFT_INSTALL_CLUSTER_JSON    PATH to the rendered Cluster object
 #
-# Two more are set for the ignitionReady phase only, because nothing else may
+# Two more are set for the ignition phase only, because nothing else may
 # see them:
 #
 #   OPENSHIFT_INSTALL_BOOTSTRAP_IGNITION  PATH to the installer's finished
@@ -125,10 +125,11 @@ CCM_STATE="${OPENSHIFT_INSTALL_STATE_DIR}/oci-ccm-secrets.yaml"
 # Storage and left a ~300-byte pointer behind, between `create
 # ignition-configs` and `create cluster`.
 #
-# THE ignitionReady HOOK IS THAT STEP, DECLARED. It runs once the installer's
-# ignition assets are final and before any Cluster API object is applied, and
-# it hands back a pointer config at the descriptor's bootstrapOutputPath.
-# hooks/ignition-ready.sh writes the file below; pre-destroy reads it and
+# THE ignition HOOK IS THAT STEP, DECLARED. It runs at the installer's
+# IgnitionProvider point of extension -- after the Cluster reports its
+# infrastructure ready and before any Machine is created -- and it hands back
+# a pointer config at the descriptor's bootstrapOutputPath.
+# hooks/ignition.sh writes the file below; pre-destroy reads it and
 # treats its absence as "nothing to do", which is still the correct reading
 # for a payload that does not declare the hook.
 #
