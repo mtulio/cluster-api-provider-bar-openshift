@@ -275,32 +275,32 @@ render_ccm_secrets() {
 	fi
 }
 
-# Try to land the Secrets as day-0 content. Whether <install-dir>/openshift
-# still exists and is still consumed at infra-ready is UNVERIFIED. If it does
-# not, post-provision applies them instead, at the cost of the CCM
-# crash-looping until then.
+# NO HOOK CAN PRODUCE A DAY-0 MANIFEST, AND THIS ONE USED TO TRY
 #
-# The Secrets cannot simply live in manifests/ with the rest of the CCM: their
+# An earlier version of this file copied the rendered Secrets into
+# <install-dir>/openshift in the hope they would be folded into the bootstrap
+# as day-0 content, and recorded in the state file which of the two routes it
+# had taken. The note said the route was UNVERIFIED. It is now verified, and
+# it is dead: pkg/asset/cluster/cluster.go:74 lists &bootstrap.Bootstrap{} as
+# a dependency of the Cluster asset, so the bootstrap ignition -- and every
+# manifest folded into it -- is complete before Provision is entered and
+# before any hook of any phase runs. The copy landed in a directory nothing
+# read again. The branch never fired, and a branch that cannot fire is worse
+# than no branch: it made the file read as though day-0 delivery were a
+# possibility a partner should design around.
+#
+# So post-provision applies these unconditionally, and the CCM crash-loops
+# until it does. That is the cost of the credential not existing at day 0, and
+# on this platform it is unavoidable rather than a choice: the Secrets'
 # contents depend on cloud identifiers that do not exist until the network is
 # built, and manifests/ is rendered with clusterctl substitution long before
 # that. This is the case a hook exists for.
-place_ccm_secrets() {
-	local openshift_dir="${OPENSHIFT_INSTALL_DIR:-.}/openshift"
-	if [[ -d ${openshift_dir} ]]; then
-		cp "${CCM_STATE}" "${openshift_dir}/99_external-01-oci-ccm-config.yaml"
-		log "placed CCM/CSI config in ${openshift_dir} as day-0 content"
-		printf 'day0'
-	else
-		log "no ${openshift_dir}; CCM/CSI config will be applied at post-provision"
-		printf 'post-provision'
-	fi
-}
 # ---------------------------------------------------------------------------
 # infra-ready
 # ---------------------------------------------------------------------------
 
 main() {
-	local compartment_id vcn nlb api_ip internal_ip lb_subnet lb_seclist lb_nsg zone_id ccm_mode
+	local compartment_id vcn nlb api_ip internal_ip lb_subnet lb_seclist lb_nsg zone_id
 
 	compartment_id=$(compartment)
 	vcn=$(vcn_id)
@@ -349,9 +349,11 @@ main() {
 		fi
 	fi
 
-	# 4. The CCM and CSI config.
+	# 4. The CCM and CSI config. Rendered here because this is the first
+	#    moment the cloud identifiers it needs exist; applied at
+	#    post-provision because that is the first moment a cluster exists to
+	#    apply it to.
 	render_ccm_secrets "${compartment_id}" "${vcn}" "${lb_subnet}" "${lb_seclist}"
-	ccm_mode=$(place_ccm_secrets)
 
 	# 5. Record everything created, for pre-destroy. Nothing here is owned by
 	#    Cluster API, so nothing else will remove it.
@@ -361,11 +363,10 @@ main() {
 		--arg nlb "${nlb}" \
 		--arg compartment "${compartment_id}" \
 		--arg vcn "${vcn}" \
-		--arg ccm_mode "${ccm_mode}" \
 		--arg lb_subnet "${lb_subnet}" \
 		--arg lb_nsg "${lb_nsg}" \
 		'{privateZoneId:$zone, publicZoneId:$public_zone, nlbId:$nlb,
-		  compartmentId:$compartment, vcnId:$vcn, ccmMode:$ccm_mode,
+		  compartmentId:$compartment, vcnId:$vcn,
 		  serviceLbSubnetId:$lb_subnet, serviceLbNsgId:$lb_nsg}' >"${STATE}"
 
 	log "infra-ready complete"

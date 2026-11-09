@@ -94,7 +94,26 @@
 set -euo pipefail
 
 log() { printf '%s %s\n' "[$(date -u +%H:%M:%S)] external-hook:" "$*" >&2; }
-die() { log "ERROR: $*"; exit 1; }
+# die ends the hook, and gives the installer this hook's own words for its
+# error rather than only a path to a log the reader has to go and open.
+#
+# OPENSHIFT_INSTALL_HOOK_FAILURE_FILE is how that is offered. Writing it is
+# optional and its content is the hook author's choice, and that is the whole
+# design: the installer cannot simply quote a hook's last output, because the
+# ignition phase's natural output is a pre-signed URL over the entire bootstrap
+# ignition -- and on this payload that is not hypothetical, it is exactly what
+# hooks/ignition.sh produces.
+#
+# Best-effort. A hook whose failure file cannot be written still fails for the
+# original reason, and that reason is still in this log; losing the summary
+# must not become a second, confusing error on top of the first.
+die() {
+	log "ERROR: $*"
+	if [[ -n ${OPENSHIFT_INSTALL_HOOK_FAILURE_FILE:-} ]]; then
+		printf '%s\n' "$*" >"${OPENSHIFT_INSTALL_HOOK_FAILURE_FILE}" 2>/dev/null || true
+	fi
+	exit 1
+}
 
 for tool in oci jq; do
 	command -v "${tool}" >/dev/null 2>&1 || die "${tool} is not on PATH"
