@@ -1,0 +1,150 @@
+# yamllint disable rule:line-length
+#
+# The long line is the Ignition data URL carrying the base64 of the script
+# reproduced in full below. Ignition requires file contents as a single data
+# URL, so it cannot be wrapped; the plaintext under it is what a reviewer
+# should read instead.
+#
+# Set every node's hostname from the OCI instance metadata service.
+#
+# The other half of what `platform: external` needs before a node can go Ready.
+# 99_external-00-kubelet-providerid-worker.yaml gives the node a provider ID;
+# this gives it a NAME. Both run before the kubelet, and the cluster fails in a
+# different way without each.
+#
+# An earlier revision of this example deliberately left this out, on the
+# grounds that the providerID manifest should cover "one concern". A run proved
+# that wrong: all three masters registered as "localhost.localdomain" and
+# fought over a single Node object. The omission is recorded rather than
+# quietly reversed -- see README.md, "What the CCM needs that CAPI
+# cannot give it".
+#
+# The script below is base64 in the manifest because Ignition stores file
+# contents as a data URL. It is reproduced in plain text here so it can be
+# reviewed without decoding. The two are checked against each other in CI:
+# editing one and not the other fails the build.
+#
+# THE SCRIPT WRITES ITS SHELL EXPANSIONS WITHOUT BRACES -- `$name`, not the
+# braced form -- AND MUST KEEP DOING SO. This file lives in the payload's
+# manifestTemplates tree, which the installer renders with clusterctl-style
+# variable substitution. That substitution matches every braced expansion in
+# the file TEXT: it has no notion of a YAML comment and no escape for a
+# literal (render.go:30, verified at installer bde084b0d0). Braces here would
+# be read as five undeclared variables and the install would be refused at
+# validation with "no value and no default" -- before any cloud call, for a
+# comment. The brace-free forms are exactly equivalent shell, because every
+# expansion in this script is followed by `/`, `"` or the end of a word.
+#
+# This note deliberately contains no braced expansion of its own, for the same
+# reason. CI enforces it.
+#
+#   #!/bin/bash
+#   # Set this node's hostname from the OCI instance metadata service.
+#   #
+#   # WHY THIS EXISTS. RHCOS boots here with ignition.platform.id=openstack,
+#   # because that is the only artifact whose Ignition provider reads OCI's
+#   # metadata channel -- see README.md, "RHCOS boot images". Afterburn then asks the
+#   # OpenStack metadata API for a hostname. OCI does not serve that API, so the
+#   # answer is nothing and the hostname stays at its default.
+#   #
+#   # MEASURED: without this unit every machine registers as
+#   # "localhost.localdomain", so three masters contend for ONE Node object and the
+#   # cluster cannot form. Oracle ships an equivalent oci-hostname-update.service;
+#   # this is a hardened rewrite of it -- theirs is WantedBy=multi-user.target with
+#   # no ordering against the kubelet, writes /etc/hostname without applying it to
+#   # the running system, and shells out to jq.
+#   set -e -o pipefail
+#
+#   IMDS=http://169.254.169.254/opc/v2/instance
+#
+#   current=$(hostnamectl --static 2>/dev/null || true)
+#   case $current in
+#   "" | localhost | localhost.localdomain) ;;
+#   *)
+#   	echo "hostname already set to $current; leaving it alone"
+#   	exit 0
+#   	;;
+#   esac
+#
+#   # Two fields, in order of preference. `hostname` is what OCI's own DHCP would
+#   # hand out and is already DNS-safe; `displayName` is the fallback and is what
+#   # Oracle's version uses. Asking for a single field rather than the whole
+#   # document keeps jq out of the dependency list -- it is not guaranteed present
+#   # in the initramfs-adjacent environment this runs in.
+#   # `hostname` is absent unless the VNIC carries a hostnameLabel, and CAPOCI does
+#   # not set one -- curl -f then exits non-zero on the 404 and the loop falls
+#   # through to displayName, which CAPOCI sets to the Machine name
+#   # (e.g. <infraID>-master-0). Both are tried every round so that a late-arriving
+#   # hostname still wins.
+#   name=""
+#   for _ in $(seq 1 30); do
+#   	for field in hostname displayName; do
+#   		raw=$(curl -fsSL --max-time 10 \
+#   			-H "Authorization: Bearer Oracle" "$IMDS/$field" || true)
+#   		# Defensive: IMDS returns a bare string for a single field, but strip
+#   		# surrounding quotes and whitespace in case it ever returns JSON, and
+#   		# lowercase it because a Node name must be lowercase.
+#   		name=$(printf '%s' "$raw" | tr -d '"[:space:]' | tr '[:upper:]' '[:lower:]')
+#   		case $name in
+#   		"" | localhost | localhost.localdomain) name="" ;;
+#   		*[!a-z0-9.-]*)
+#   			echo "ignoring $field: not a valid hostname" >&2
+#   			name=""
+#   			;;
+#   		*) break 2 ;;
+#   		esac
+#   	done
+#   	sleep 5
+#   done
+#
+#   if [ -z "$name" ]; then
+#   	echo "could not read a usable hostname from $IMDS after 30 attempts" >&2
+#   	exit 1
+#   fi
+#
+#   # hostnamectl rather than `echo > /etc/hostname`: it sets the running hostname
+#   # as well as the persistent one. Writing the file alone leaves the kernel
+#   # hostname at localhost until the next reboot, which is exactly when the
+#   # kubelet reads it.
+#   hostnamectl set-hostname "$name"
+#   echo "hostname set to $name"
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  labels:
+    machineconfiguration.openshift.io/role: worker
+  name: 00-worker-oci-hostname
+spec:
+  config:
+    ignition:
+      version: 3.4.0
+    storage:
+      files:
+      - path: /usr/local/bin/oci-set-hostname
+        mode: 493
+        overwrite: true
+        contents:
+          source: data:text/plain;charset=utf-8;base64,IyEvYmluL2Jhc2gKIyBTZXQgdGhpcyBub2RlJ3MgaG9zdG5hbWUgZnJvbSB0aGUgT0NJIGluc3RhbmNlIG1ldGFkYXRhIHNlcnZpY2UuCiMKIyBXSFkgVEhJUyBFWElTVFMuIFJIQ09TIGJvb3RzIGhlcmUgd2l0aCBpZ25pdGlvbi5wbGF0Zm9ybS5pZD1vcGVuc3RhY2ssCiMgYmVjYXVzZSB0aGF0IGlzIHRoZSBvbmx5IGFydGlmYWN0IHdob3NlIElnbml0aW9uIHByb3ZpZGVyIHJlYWRzIE9DSSdzCiMgbWV0YWRhdGEgY2hhbm5lbCAtLSBzZWUgUkVBRE1FLm1kLCAiUkhDT1MgYm9vdCBpbWFnZXMiLiBBZnRlcmJ1cm4gdGhlbiBhc2tzIHRoZQojIE9wZW5TdGFjayBtZXRhZGF0YSBBUEkgZm9yIGEgaG9zdG5hbWUuIE9DSSBkb2VzIG5vdCBzZXJ2ZSB0aGF0IEFQSSwgc28gdGhlCiMgYW5zd2VyIGlzIG5vdGhpbmcgYW5kIHRoZSBob3N0bmFtZSBzdGF5cyBhdCBpdHMgZGVmYXVsdC4KIwojIE1FQVNVUkVEOiB3aXRob3V0IHRoaXMgdW5pdCBldmVyeSBtYWNoaW5lIHJlZ2lzdGVycyBhcwojICJsb2NhbGhvc3QubG9jYWxkb21haW4iLCBzbyB0aHJlZSBtYXN0ZXJzIGNvbnRlbmQgZm9yIE9ORSBOb2RlIG9iamVjdCBhbmQgdGhlCiMgY2x1c3RlciBjYW5ub3QgZm9ybS4gT3JhY2xlIHNoaXBzIGFuIGVxdWl2YWxlbnQgb2NpLWhvc3RuYW1lLXVwZGF0ZS5zZXJ2aWNlOwojIHRoaXMgaXMgYSBoYXJkZW5lZCByZXdyaXRlIG9mIGl0IC0tIHRoZWlycyBpcyBXYW50ZWRCeT1tdWx0aS11c2VyLnRhcmdldCB3aXRoCiMgbm8gb3JkZXJpbmcgYWdhaW5zdCB0aGUga3ViZWxldCwgd3JpdGVzIC9ldGMvaG9zdG5hbWUgd2l0aG91dCBhcHBseWluZyBpdCB0bwojIHRoZSBydW5uaW5nIHN5c3RlbSwgYW5kIHNoZWxscyBvdXQgdG8ganEuCnNldCAtZSAtbyBwaXBlZmFpbAoKSU1EUz1odHRwOi8vMTY5LjI1NC4xNjkuMjU0L29wYy92Mi9pbnN0YW5jZQoKY3VycmVudD0kKGhvc3RuYW1lY3RsIC0tc3RhdGljIDI+L2Rldi9udWxsIHx8IHRydWUpCmNhc2UgJGN1cnJlbnQgaW4KIiIgfCBsb2NhbGhvc3QgfCBsb2NhbGhvc3QubG9jYWxkb21haW4pIDs7CiopCgllY2hvICJob3N0bmFtZSBhbHJlYWR5IHNldCB0byAkY3VycmVudDsgbGVhdmluZyBpdCBhbG9uZSIKCWV4aXQgMAoJOzsKZXNhYwoKIyBUd28gZmllbGRzLCBpbiBvcmRlciBvZiBwcmVmZXJlbmNlLiBgaG9zdG5hbWVgIGlzIHdoYXQgT0NJJ3Mgb3duIERIQ1Agd291bGQKIyBoYW5kIG91dCBhbmQgaXMgYWxyZWFkeSBETlMtc2FmZTsgYGRpc3BsYXlOYW1lYCBpcyB0aGUgZmFsbGJhY2sgYW5kIGlzIHdoYXQKIyBPcmFjbGUncyB2ZXJzaW9uIHVzZXMuIEFza2luZyBmb3IgYSBzaW5nbGUgZmllbGQgcmF0aGVyIHRoYW4gdGhlIHdob2xlCiMgZG9jdW1lbnQga2VlcHMganEgb3V0IG9mIHRoZSBkZXBlbmRlbmN5IGxpc3QgLS0gaXQgaXMgbm90IGd1YXJhbnRlZWQgcHJlc2VudAojIGluIHRoZSBpbml0cmFtZnMtYWRqYWNlbnQgZW52aXJvbm1lbnQgdGhpcyBydW5zIGluLgojIGBob3N0bmFtZWAgaXMgYWJzZW50IHVubGVzcyB0aGUgVk5JQyBjYXJyaWVzIGEgaG9zdG5hbWVMYWJlbCwgYW5kIENBUE9DSSBkb2VzCiMgbm90IHNldCBvbmUgLS0gY3VybCAtZiB0aGVuIGV4aXRzIG5vbi16ZXJvIG9uIHRoZSA0MDQgYW5kIHRoZSBsb29wIGZhbGxzCiMgdGhyb3VnaCB0byBkaXNwbGF5TmFtZSwgd2hpY2ggQ0FQT0NJIHNldHMgdG8gdGhlIE1hY2hpbmUgbmFtZQojIChlLmcuIDxpbmZyYUlEPi1tYXN0ZXItMCkuIEJvdGggYXJlIHRyaWVkIGV2ZXJ5IHJvdW5kIHNvIHRoYXQgYSBsYXRlLWFycml2aW5nCiMgaG9zdG5hbWUgc3RpbGwgd2lucy4KbmFtZT0iIgpmb3IgXyBpbiAkKHNlcSAxIDMwKTsgZG8KCWZvciBmaWVsZCBpbiBob3N0bmFtZSBkaXNwbGF5TmFtZTsgZG8KCQlyYXc9JChjdXJsIC1mc1NMIC0tbWF4LXRpbWUgMTAgXAoJCQktSCAiQXV0aG9yaXphdGlvbjogQmVhcmVyIE9yYWNsZSIgIiRJTURTLyRmaWVsZCIgfHwgdHJ1ZSkKCQkjIERlZmVuc2l2ZTogSU1EUyByZXR1cm5zIGEgYmFyZSBzdHJpbmcgZm9yIGEgc2luZ2xlIGZpZWxkLCBidXQgc3RyaXAKCQkjIHN1cnJvdW5kaW5nIHF1b3RlcyBhbmQgd2hpdGVzcGFjZSBpbiBjYXNlIGl0IGV2ZXIgcmV0dXJucyBKU09OLCBhbmQKCQkjIGxvd2VyY2FzZSBpdCBiZWNhdXNlIGEgTm9kZSBuYW1lIG11c3QgYmUgbG93ZXJjYXNlLgoJCW5hbWU9JChwcmludGYgJyVzJyAiJHJhdyIgfCB0ciAtZCAnIls6c3BhY2U6XScgfCB0ciAnWzp1cHBlcjpdJyAnWzpsb3dlcjpdJykKCQljYXNlICRuYW1lIGluCgkJIiIgfCBsb2NhbGhvc3QgfCBsb2NhbGhvc3QubG9jYWxkb21haW4pIG5hbWU9IiIgOzsKCQkqWyFhLXowLTkuLV0qKQoJCQllY2hvICJpZ25vcmluZyAkZmllbGQ6IG5vdCBhIHZhbGlkIGhvc3RuYW1lIiA+JjIKCQkJbmFtZT0iIgoJCQk7OwoJCSopIGJyZWFrIDIgOzsKCQllc2FjCglkb25lCglzbGVlcCA1CmRvbmUKCmlmIFsgLXogIiRuYW1lIiBdOyB0aGVuCgllY2hvICJjb3VsZCBub3QgcmVhZCBhIHVzYWJsZSBob3N0bmFtZSBmcm9tICRJTURTIGFmdGVyIDMwIGF0dGVtcHRzIiA+JjIKCWV4aXQgMQpmaQoKIyBob3N0bmFtZWN0bCByYXRoZXIgdGhhbiBgZWNobyA+IC9ldGMvaG9zdG5hbWVgOiBpdCBzZXRzIHRoZSBydW5uaW5nIGhvc3RuYW1lCiMgYXMgd2VsbCBhcyB0aGUgcGVyc2lzdGVudCBvbmUuIFdyaXRpbmcgdGhlIGZpbGUgYWxvbmUgbGVhdmVzIHRoZSBrZXJuZWwKIyBob3N0bmFtZSBhdCBsb2NhbGhvc3QgdW50aWwgdGhlIG5leHQgcmVib290LCB3aGljaCBpcyBleGFjdGx5IHdoZW4gdGhlCiMga3ViZWxldCByZWFkcyBpdC4KaG9zdG5hbWVjdGwgc2V0LWhvc3RuYW1lICIkbmFtZSIKZWNobyAiaG9zdG5hbWUgc2V0IHRvICRuYW1lIgo=
+    systemd:
+      units:
+      - name: oci-set-hostname.service
+        enabled: true
+        contents: |
+          [Unit]
+          Description=Set the node hostname from the OCI instance metadata service
+          # Ordering is the whole point. The kubelet takes its node name from the
+          # hostname at start and never revisits it, so this must win the race that
+          # Oracle's version loses. node-valid-hostname.service is RHCOS's own guard
+          # against a localhost node name; ordering before it means we satisfy that
+          # guard rather than waiting out its timeout.
+          After=NetworkManager-wait-online.service
+          Before=node-valid-hostname.service
+          Before=kubelet.service
+          [Service]
+          ExecStart=/usr/local/bin/oci-set-hostname
+          Type=oneshot
+          RemainAfterExit=yes
+          StandardOutput=journal+console
+          StandardError=journal+console
+          [Install]
+          WantedBy=multi-user.target

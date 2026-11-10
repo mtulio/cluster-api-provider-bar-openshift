@@ -1,0 +1,499 @@
+# Build, verify and publish the Bar provider payload image to GitHub Container
+# Registry.
+#
+# The image is built on every pull request, every push to main and every v* tag.
+# What differs is the tag it is published under:
+#
+#   pull request   PR-<number>        overwritten on every push to that PR
+#   main           main               moving tag for the tip of the branch
+#   v* tag         <tag>, and latest  latest only for a final vX.Y.Z, not a prerelease
+#
+# Every build also runs the "Before you publish" checks from README.md. The payload
+# image is the provider's supported artifact and nothing downstream re-validates it,
+# so a build that cannot prove its own layout must not be published.
+#
+# podman is used rather than docker/buildx so that CI runs the same command the
+# README documents. The Containerfile deliberately avoids `ADD --checksum`, which
+# would need podman 5.0 or BuildKit, so this job has no builder version floor.
+#
+# WHAT DIFFERS FROM THE FOO PAYLOAD'S IDENTICAL WORKFLOW
+#
+# Bar declares five executables where Foo declares four: it has a fourth hook,
+# ignition, because CAPOCI cannot stage an oversized bootstrap ignition
+# itself. Otherwise the layout checks are now identical, which they were not
+# before: Bar used to ship a POSIX sh shim at bin/controller with Oracle's real
+# manager carried alongside it as DATA at 0644, because the installer injected
+# a flag name CAPOCI does not accept and the descriptor had one controller
+# slot. spec.capi.controllerArgs ended that -- the payload names CAPOCI's own
+# flag, bin/controller is the manager, and the shim, its lint, its behaviour
+# test and the manager-is-data assertion are all gone.
+#
+# A second job, `verify-sources`, has no counterpart in the Foo payload. Bar
+# carries ~1,500 lines of hook shell that Foo does not, and the image is built
+# from scratch with no shell in it, so nothing at runtime would catch a syntax
+# error before an install does.
+name: payload-image
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+
+# A new push to a PR makes the previous build obsolete; stop it rather than racing
+# it to the same PR-<number> tag.
+concurrency:
+  group: payload-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # Source-level gates. Deliberately a separate job: it needs no image and no
+  # registry permission, it finishes in seconds, and a syntax error in a hook
+  # should be reported as a syntax error rather than as a failed image build.
+  verify-sources:
+    name: verify sources
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shell syntax and shellcheck
+        run: |
+          set -euo pipefail
+
+          for f in hooks/*.sh hooks/lib/common.sh; do bash -n "$f"; echo "bash -n  ${f}  OK"; done
+
+          # The same shellcheck image the installer's hack/shellcheck.sh uses,
+          # so a hook that passes here passes there too. -x follows the
+          # `# shellcheck source=` directives into lib/common.sh.
+          podman run --rm -v "${PWD}:/workdir:z" -w /workdir \
+            --entrypoint sh quay.io/coreos/shellcheck-alpine:v0.5.0 \
+            -c 'shellcheck --format=gcc -x hooks/*.sh hooks/lib/common.sh'
+          echo "shellcheck: clean"
+
+      - name: YAML parses, and the manifest documents are single-object
+        run: |
+          set -euo pipefail
+          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
+
+          # manifestTemplates land in <install-dir>/manifests/, where the
+          # installer counts documents in each extra manifest and rejects a
+          # multi-document file (pkg/asset/manifests/openshift.go:426).
+          # clusterTemplates have no such limit and legitimately hold several
+          # objects per file, so the two trees are checked under different rules.
+          #
+          # Parsed with the clusterctl placeholders left in place: ${VAR} is a
+          # plain scalar to a YAML parser, so this validates structure without
+          # needing any variable to be set.
+          python3 - <<'PY'
+          import pathlib, sys, yaml
+          rc = 0
+          for tree, single in (("manifests", True), ("cluster-api", False)):
+              for p in sorted(pathlib.Path(tree).rglob("*.yaml")):
+                  try:
+                      docs = [d for d in yaml.safe_load_all(p.read_text()) if d]
+                  except yaml.YAMLError as e:
+                      print(f"::error file={p}::unparseable: {e.__class__.__name__}")
+                      rc = 1
+                      continue
+                  if not docs:
+                      print(f"::error file={p}::no objects")
+                      rc = 1
+                  elif single and len(docs) != 1:
+                      print(f"::error file={p}::{len(docs)} documents; "
+                            "an extra manifest must hold exactly one object")
+                      rc = 1
+                  else:
+                      kinds = ",".join(d.get("kind", "?") for d in docs)
+                      print(f"{str(p):62} {len(docs)} doc(s)  {kinds}")
+          sys.exit(rc)
+          PY
+
+      # Two invariants that no other gate catches, and that a reviewer reading
+      # a diff would not catch either. Both were found the hard way while
+      # building this payload.
+      - name: Template tokens and embedded-script integrity
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, pathlib, re, sys
+          rc = 0
+
+          # 1. Every ${...} the renderer will see belongs to a declared
+          #    namespace.
+          #
+          #    The installer's substitution (render.go:30) matches any
+          #    ${identifier} in the FILE TEXT. It does not know what a YAML
+          #    comment is and it has no escape for a literal. So a shell
+          #    snippet reproduced in a comment -- exactly what these manifests
+          #    do for reviewability -- becomes a set of undeclared variables,
+          #    and the install is refused at validation with "no value and no
+          #    default". INSTALLER_* comes from the installer; OCI_* is this
+          #    payload's namespace; anything else is a mistake.
+          tok = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)')
+          for tree in ("manifests", "cluster-api"):
+              for p in sorted(pathlib.Path(tree).rglob("*.yaml")):
+                  for i, line in enumerate(p.read_text().splitlines(), 1):
+                      for name in tok.findall(line):
+                          if not name.startswith(("INSTALLER_", "OCI_")):
+                              print(f"::error file={p},line={i}::"
+                                    f"${{{name}}} is not a declared variable; "
+                                    "write $name without braces, or namespace it")
+                              rc = 1
+
+          # 2. A base64 data URL and the plaintext reproduced above it say the
+          #    same thing.
+          #
+          #    Ignition stores file contents as a single data URL, so the real
+          #    script is unreadable in review and a copy is carried in a
+          #    comment. Editing the readable copy and not the encoded one is
+          #    the obvious failure, and it is silent: the manifest stays valid
+          #    and the node runs the old script.
+          for p in sorted(pathlib.Path("manifests").rglob("*.yaml")):
+              t = p.read_text()
+              m = re.search(r'base64,([A-Za-z0-9+/=]+)', t)
+              if not m or "#   #!" not in t:
+                  continue
+              script = base64.b64decode(m.group(1)).decode()
+              repro = "\n".join('#' if l == '' else '#   ' + l
+                                for l in script.rstrip("\n").split("\n"))
+              if repro in t:
+                  print(f"{str(p):62} embedded script matches its reproduction "
+                        f"({len(script)} bytes)")
+              else:
+                  print(f"::error file={p}::the reproduced script and the "
+                        "base64 have drifted; regenerate one from the other")
+                  rc = 1
+          sys.exit(rc)
+          PY
+
+      # The flag mismatch that used to need a shim is now the payload's own
+      # declaration, so what is asserted here is the declaration rather than a
+      # wrapper's behaviour. No image and no cloud: it reads openshift.yaml.
+      - name: controllerArgs carries the installer's render tokens, exactly once
+        run: |
+          set -euo pipefail
+          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
+          python3 - <<'PY'
+          import sys, yaml
+          doc = yaml.safe_load(open("openshift.yaml"))
+          args = doc["spec"]["capi"]["controllerArgs"]
+          bad = False
+
+          # The installer renders these and a controller whose webhook does not
+          # match the one the installer installed fails late and obscurely, so
+          # the requirement is on the tokens, not on any particular flag name.
+          for token in ("{{.WebhookPort}}", "{{.WebhookCertDir}}"):
+              n = sum(a.count(token) for a in args)
+              if n != 1:
+                  print(f"::error::controllerArgs: {token} appears {n} times, expected 1")
+                  bad = True
+
+          # Appended by the installer (pkg/clusterapi/system.go:703-705).
+          if any(a.split("=", 1)[0] == "--kubeconfig" for a in args):
+              print("::error::controllerArgs declares --kubeconfig, which the installer appends")
+              bad = True
+
+          # The regression this payload exists to prevent. CAPOCI declares
+          # --health-probe-bind-address (main.go:100) and exits non-zero on an
+          # unknown flag (main.go:178-180); --health-addr is CAPA's spelling and
+          # is what the installer used to inject, which is what forced the shim.
+          if any(a.startswith("--health-addr") for a in args):
+              print("::error::controllerArgs declares --health-addr; CAPOCI wants "
+                    "--health-probe-bind-address and exits on an unknown flag")
+              bad = True
+
+          print(f"controllerArgs: {len(args)} args, render tokens OK")
+          sys.exit(1 if bad else 0)
+          PY
+
+  build:
+    name: build and publish
+    runs-on: ubuntu-24.04
+    needs: verify-sources
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image name and tags
+        id: image
+        run: |
+          set -euo pipefail
+
+          # Registry paths must be lowercase; tags may not be.
+          name="${REGISTRY}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+
+          case "${GITHUB_EVENT_NAME}" in
+            pull_request)
+              tags="PR-${PR_NUMBER}"
+              ;;
+            push)
+              if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+                tags="${GITHUB_REF_NAME}"
+                # A prerelease (v1.0.0-rc.1) must not move `latest`.
+                if echo "${GITHUB_REF_NAME}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+                  tags="${tags} latest"
+                fi
+              else
+                tags="main"
+              fi
+              ;;
+            *)
+              echo "unsupported event ${GITHUB_EVENT_NAME}" >&2
+              exit 1
+              ;;
+          esac
+
+          # A pull request from a fork gets a read-only GITHUB_TOKEN, so it is built
+          # and verified but not published. Saying so here beats failing at push.
+          push=true
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && \
+             [ "${PR_HEAD_REPO}" != "${GITHUB_REPOSITORY}" ]; then
+            push=false
+            echo "::notice::fork pull request - building and verifying only, not publishing"
+          fi
+
+          {
+            echo "name=${name}"
+            echo "tags=${tags}"
+            echo "primary=${name}:$(echo "${tags}" | cut -d' ' -f1)"
+            echo "push=${push}"
+          } >> "${GITHUB_OUTPUT}"
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          podman --version
+
+          args=()
+          for t in ${TAGS}; do
+            args+=(--tag "${NAME}:${t}")
+          done
+
+          podman build \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${args[@]}" \
+            --file Containerfile \
+            .
+        env:
+          NAME: ${{ steps.image.outputs.name }}
+          TAGS: ${{ steps.image.outputs.tags }}
+
+      - name: Verify the payload
+        run: |
+          set -euo pipefail
+          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
+
+          root=$(mktemp -d)
+          # The command argument is required and never runs. A scratch image has
+          # no ENTRYPOINT or CMD, and podman 4.x refuses to create a container
+          # without one ("no command or entrypoint provided"); podman 5.x allows
+          # it. The container is only ever exported, never started.
+          cid=$(podman create "${IMAGE}" /bin/controller)
+          podman export "${cid}" | tar -x -C "${root}"
+          podman rm "${cid}" >/dev/null
+
+          rc=0
+
+          # 1. Every path openshift.yaml declares exists, and the hooks are executable.
+          python3 - "${root}" <<'PY' || rc=1
+          import os, sys, yaml
+          root = sys.argv[1]
+          doc = yaml.safe_load(open(os.path.join(root, "openshift.yaml")))
+          bad = False
+
+          if doc.get("kind") != "ExternalProviderPayload":
+              print(f"kind: {doc.get('kind')!r}, expected ExternalProviderPayload")
+              bad = True
+          # Must equal platform.external.platformName; the installer refuses the
+          # install if they differ, so an empty one is a payload nobody can use.
+          if not doc.get("metadata", {}).get("name"):
+              print("metadata.name: missing")
+              bad = True
+
+          spec = doc["spec"]
+          capi, ocp = spec["capi"], spec["openshift"]
+          paths = [("capi.controller", capi["controller"], True),
+                   ("capi.infrastructureComponents", capi["infrastructureComponents"], False),
+                   ("capi.clusterTemplates", capi["clusterTemplates"], False),
+                   ("openshift.manifestTemplates", ocp["manifestTemplates"], False)]
+          if "e2e" in capi:
+              paths += [("capi.e2e.program", capi["e2e"]["program"], True)]
+          paths += [("openshift.installerHooks." + k, v["program"], True)
+                    for k, v in ocp["installerHooks"].items()]
+          paths += [("metadata.yaml", "metadata.yaml", False)]
+          for key, rel, must_exec in paths:
+              full = os.path.join(root, rel)
+              ok = os.path.exists(full)
+              ex = ok and os.access(full, os.X_OK)
+              if not ok or (must_exec and not ex):
+                  bad = True
+              print(f"{key:38} {rel:38} {'OK' if ok else 'MISSING':8} exec={ex}")
+
+          # ignition is the one phase that carries a second field, and the
+          # installer reads that file back. A payload that declares the hook and
+          # not the path is refused at validation.
+          ign = ocp["installerHooks"].get("ignition")
+          if ign is not None and not ign.get("bootstrapOutputPath"):
+              print("installerHooks.ignition: bootstrapOutputPath is required")
+              bad = True
+
+          c = spec["compatibility"]["kubernetes"]
+          print(f"compatibility: kubernetes {c['min']} - {c['max']}")
+          sys.exit(1 if bad else 0)
+          PY
+
+          # 2. Exactly the declared executables and no others. Layout validation
+          #    rejects an executable the descriptor does not name, so an extra one
+          #    is not harmless - it is a payload that fails to install.
+          #
+          #    bin/controller is Oracle's CAPOCI manager, renamed. It used to be
+          #    a shim with the manager carried alongside it as non-executable
+          #    data; spec.capi.controllerArgs removed the need for both, so this
+          #    set is now exactly the declared one with no exception carved out.
+          found=$(cd "${root}" && find . -type f -perm -u+x | sed 's|^\./||' | sort)
+          expected=$(printf '%s\n' bin/controller hooks/ignition.sh \
+                       hooks/infra-ready.sh hooks/post-provision.sh \
+                       hooks/pre-destroy.sh | sort)
+          if [ "${found}" != "${expected}" ]; then
+            echo "::error::executables in the image do not match the declared set"
+            diff <(echo "${expected}") <(echo "${found}") || true
+            rc=1
+          else
+            echo "executables: 5, as declared"
+          fi
+
+          # 2b. No stray bin/manager. The shim is gone and so is the data copy
+          #     it chmod'd; a build that reintroduces one is shipping a second
+          #     controller the descriptor does not declare.
+          if [ -e "${root}/bin/manager" ]; then
+            echo "::error::bin/manager exists; the shim was removed and bin/controller is the manager"
+            rc=1
+          fi
+
+          # 3. The installer runs the controller as a host process, not in a
+          #    container, so it cannot rely on this image's libc.
+          #
+          #    The binary under test is bin/controller, the same path the Foo
+          #    payload checks. While the shim existed this had to target
+          #    bin/manager instead, because bin/controller was a shell script
+          #    and `file` would have said so -- a vacuous pass.
+          if file "${root}/bin/controller" | grep -q 'statically linked'; then
+            echo "controller: statically linked"
+          else
+            echo "::error::bin/controller is not statically linked"
+            file "${root}/bin/controller"
+            rc=1
+          fi
+
+          # 4. No credentials and nothing customer-specific. A provider payload is a
+          #    generic, multi-tenant artifact. Counts only - never print a match.
+          #
+          #    ocid1.* is included because an OCID names a specific tenancy,
+          #    compartment or subnet: a payload carrying one is not generic, even
+          #    though an OCID is not itself a secret. Every OCI identifier in this
+          #    repository is a ${VAR} the cluster creator supplies.
+          #
+          #    There is no allowlist, and that is a measured fact rather than an
+          #    oversight: CAPOCI's published infrastructure-components.yaml
+          #    (sha256:55bd3342...) matches none of these patterns. The Foo payload
+          #    needs one only because CAPA's bundle embeds AWS's own documentation
+          #    placeholder. If a future CAPOCI release introduces an example
+          #    credential, add it here by exact literal and say why - never relax
+          #    the pattern.
+          for pat in 'BEGIN [A-Z ]*PRIVATE KEY' 'ssh-(rsa|ed25519|dss)' \
+                     'AKIA[0-9A-Z]{16}' 'ocid1\.[a-z0-9]+\.oc1' \
+                     'eyJ[A-Za-z0-9_-]{20,}'; do
+            n=$(grep -rIcE "${pat}" "${root}" 2>/dev/null | awk -F: '{s+=$NF} END {print s+0}')
+            echo "secret-shape '${pat}': ${n} match(es)"
+            if [ "${n}" -ne 0 ]; then
+              echo "::error::'${pat}' matched ${n} time(s) in the payload"
+              # Filenames only. The matched text is never printed.
+              grep -rIlE "${pat}" "${root}" | sed "s|^${root}/||"
+              rc=1
+            fi
+          done
+
+          rm -rf "${root}"
+          exit "${rc}"
+        env:
+          IMAGE: ${{ steps.image.outputs.primary }}
+
+      - name: Log in to ${{ env.REGISTRY }}
+        if: steps.image.outputs.push == 'true'
+        run: |
+          printf '%s' "${TOKEN}" \
+            | podman login "${REGISTRY}" --username "${GITHUB_ACTOR}" --password-stdin
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: steps.image.outputs.push == 'true'
+        run: |
+          set -euo pipefail
+          for t in ${TAGS}; do
+            podman push "${NAME}:${t}"
+            echo "pushed ${NAME}:${t}"
+          done
+
+          digest=$(podman image inspect "${PRIMARY}" --format '{{ .Digest }}')
+          {
+            echo "## Published"
+            echo
+            for t in ${TAGS}; do echo "- \`${NAME}:${t}\`"; done
+            echo
+            echo "Consume it by digest, not by tag:"
+            echo
+            # Tilde fences, so the backticks that would otherwise sit in a shell
+            # string cannot be read as command substitution by anything parsing
+            # this step. They render identically.
+            echo '~~~yaml'
+            echo '    platform:'
+            echo '      external:'
+            echo '        platformName: bar'
+            echo '        clusterAPI:'
+            echo '          name: bar'
+            echo '          controller:'
+            echo '            image:'
+            echo "              ref: ${NAME}@${digest}"
+            echo '          bootstrapIgnitionStaging: Allowed'
+            echo '~~~'
+            echo
+            echo "bootstrapIgnitionStaging is required: this payload declares an"
+            echo "ignition hook, and the install is refused without consent."
+            echo "See README.md, \"The ignition offload, and the hook that declares it\"."
+          } >> "${GITHUB_STEP_SUMMARY}"
+        env:
+          NAME: ${{ steps.image.outputs.name }}
+          TAGS: ${{ steps.image.outputs.tags }}
+          PRIMARY: ${{ steps.image.outputs.primary }}
+
+      # Re-pushing PR-<number> leaves the previous build behind as an untagged
+      # version, which is what actually accumulates storage. Reclaim it. Best
+      # effort: a package that does not exist yet, or a permission the token does
+      # not carry, must not fail an otherwise good build.
+      - name: Prune untagged versions
+        if: steps.image.outputs.push == 'true'
+        continue-on-error: true
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ github.event.repository.name }}
+          package-type: container
+          delete-only-untagged-versions: true
+          min-versions-to-keep: 0
