@@ -99,18 +99,72 @@ spec:
     # installer does not poll /healthz. --kubeconfig is appended by the
     # installer and must not be declared here.
     #
-    # This is exactly the set the pilot ran with -- the four flags the
-    # installer injected, with --health-addr spelled the way CAPOCI spells it
-    # instead of translated by a wrapper. Nothing has been added:
-    # --init-oci-clients-on-startup is left at its default of true
-    # (main.go:153-158), which is what every measured run used, because the
-    # OCIClusterIdentity in cluster-api/cluster.yaml supplies credentials
-    # before the first reconcile.
+    # The first four are the set the pilot ran with -- the flags the installer
+    # injected, with --health-addr spelled the way CAPOCI spells it instead of
+    # translated by a wrapper.
+    #
+    # The fifth is a correction. This comment used to say that
+    # --init-oci-clients-on-startup was "left at its default of true, which is
+    # what every measured run used, because the OCIClusterIdentity supplies
+    # credentials before the first reconcile". The first half was true and the
+    # conclusion did not follow: CAPOCI reads AUTH_CONFIG_DIR at setup, before
+    # any reconcile and therefore before any OCIClusterIdentity is consulted.
+    # The pilot runs survived it only because that variable happened to be
+    # exported in the shell that drove them. A payload cannot rely on the
+    # operator's shell, and the first run that did not have it failed in a way
+    # that named nothing useful -- see below.
     controllerArgs:
     - -v=2
     - --health-probe-bind-address={{suggestHealthHostPort}}
     - --webhook-port={{.WebhookPort}}
     - --webhook-cert-dir={{.WebhookCertDir}}
+    # THE ONE PORT THE INSTALLER CANNOT CHOOSE FOR A PAYLOAD, AND THEREFORE
+    # THE ONE A PAYLOAD MUST DEAL WITH ITSELF.
+    #
+    # CAPOCI's metrics server defaults to :8080 -- every interface, a fixed
+    # port (main.go:99). The installer hands out a free port for health and
+    # for the webhook, through {{suggestHealthHostPort}} and {{.WebhookPort}},
+    # because it knows those flags exist; it has no token for a metrics
+    # address because it does not know this provider has one. Since the
+    # payload owns the whole command line, the payload owns this too.
+    #
+    # Measured on mrb-bar8 2026-11-10, with a teardown of the previous cluster
+    # running at the same time:
+    #
+    #   failed to start metrics server: failed to create listener:
+    #   listen tcp :8080: bind: address already in use
+    #
+    # The controller registered its webhooks, shut straight back down, never
+    # answered /healthz, and the installer could only report a start-up
+    # timeout. Two installs on one host collide, and so does anything else
+    # already using 8080.
+    #
+    # Disabled rather than randomised: nothing scrapes a controller that lives
+    # for the length of one install. The Foo payload does the same thing with
+    # CAPA's spelling of it, --diagnostics-address=0.
+    - --metrics-bind-address=0
+    # Without this the controller exits at setup, before answering /healthz
+    # once, and the installer reports only a start-up timeout:
+    #
+    #   E main.go:230] "auth config directory environment variable is not set"
+    #
+    # CAPOCI defaults --init-oci-clients-on-startup to true (main.go:153-158),
+    # which makes it read AUTH_CONFIG_DIR and build one tenancy's client before
+    # it reconciles anything. That default is written for how CAPOCI normally
+    # runs -- a Deployment whose environment is populated from a Secret in the
+    # cluster it manages.
+    #
+    # Neither half of that holds here. The installer runs the controller as a
+    # local OS process with no such environment, and this payload authenticates
+    # per cluster through the OCIClusterIdentity in ../cluster-api/cluster.yaml,
+    # which points at a Secret the payload deliberately does not carry -- an
+    # image holding one tenancy's API signing key is not a provider payload.
+    #
+    # So turning the startup client off is not a workaround for a defect. It is
+    # how a provider whose credentials arrive per cluster has to be run, and it
+    # is the payload's to declare because the payload owns the command line.
+    # Measured on mrb-bar3, 2026-11-09.
+    - --init-oci-clients-on-startup=false
 
     # A single file, not a directory. Every clusterctl provider already
     # publishes exactly one infrastructure-components.yaml.

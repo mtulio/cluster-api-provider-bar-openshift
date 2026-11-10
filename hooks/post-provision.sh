@@ -78,6 +78,51 @@ parse_post_provision_args() {
 # EARLIER than this -- masters fetch their config on first boot, which is
 # before post-provision runs. This is the least-settled part of the design and
 # is called out in README.md.
+# Put the bootstrap into CAPOCI's own API server backend set.
+#
+# CAPOCI does this for every machine it considers control-plane and for no
+# other (cloud/scope/machine.go:322,337, gated on IsControlPlane()). The
+# bootstrap deliberately does not carry that label -- dropping it is what lets
+# it be placed in the public subnet, which is where every other reference
+# payload puts a bootstrap and the only way `gather bootstrap` can SSH in. The
+# masters are registered by CAPOCI as before; only this one machine is missing,
+# and without it nothing serves api-int:6443 until the first master is up.
+#
+# Through nlb_mutate, for the same reason populate_mcs_backends is: a
+# concurrent CAPOCI reconcile leaves the load balancer busy and the create
+# returns 409.
+populate_apiserver_bootstrap_backend() {
+	local nlb=$1 compartment_id=$2 ocid ip
+
+	ocid=$(oci compute instance list --compartment-id "${compartment_id}" \
+		--lifecycle-state RUNNING \
+		--query "data[?\"freeform-tags\".\"openshift-cluster-id\"=='${INFRA_ID}' &&
+		          \"freeform-tags\".\"openshift-machine-role\"=='bootstrap'].id" \
+		--raw-output 2>/dev/null | jq -r '.[0]? // empty')
+	if [[ -z ${ocid} ]]; then
+		log "no bootstrap instance tagged for ${INFRA_ID}; not adding an ${APISERVER_PORT} backend"
+		return 0
+	fi
+
+	ip=$(oci compute instance list-vnics --instance-id "${ocid}" \
+		--query 'data[0]."private-ip"' --raw-output 2>/dev/null)
+	if [[ -z ${ip} || ${ip} == "null" ]]; then
+		log "no private IP for the bootstrap instance; not adding an ${APISERVER_PORT} backend"
+		return 0
+	fi
+
+	if nlb_mutate "${nlb}" "backend ${ip}:${APISERVER_PORT}" \
+		oci nlb backend create \
+		--network-load-balancer-id "${nlb}" \
+		--backend-set-name "${APISERVER_BACKENDSET}" \
+		--ip-address "${ip}" --port "${APISERVER_PORT}" \
+		--wait-for-state SUCCEEDED 2>/dev/null; then
+		log "added the bootstrap ${ip}:${APISERVER_PORT} to ${APISERVER_BACKENDSET}"
+	else
+		log "bootstrap ${ip}:${APISERVER_PORT} already a backend, or could not be added"
+	fi
+}
+
 populate_mcs_backends() {
 	local nlb=$1 compartment_id=$2 instances ocid ip count=0
 
@@ -159,6 +204,137 @@ populate_mcs_backends() {
 # the installer has exited, and nothing here will be running then. The durable
 # answer is an in-cluster controller; it is an open item in the enhancement
 # proposal and deliberately not solved here.
+
+# AN ANSWERING API IS NOT A POPULATED ONE, AND TWO SECONDS WAS THE DIFFERENCE.
+#
+# The namespaces these Secrets go into -- oci-cloud-controller-manager and
+# oci-csi -- come from this payload's own manifests/, which the bootstrap node
+# applies during cluster-bootstrap. The API starts answering before that
+# finishes. Measured on mrb-bar10 2026-11-10: the API answered at 03:34:59, the
+# apply failed at 03:35:01 because neither namespace existed yet, and the same
+# apply succeeded unchanged a few minutes later.
+#
+# Read from the document rather than hardcoded, so that changing a namespace in
+# manifests/ cannot leave a stale constant here waiting for the wrong thing.
+wait_ccm_namespaces() {
+	local deadline=$1 ns missing
+	local -a namespaces=()
+	mapfile -t namespaces < <(grep -E '^\s+namespace:' "${CCM_STATE}" 2>/dev/null |
+		awk '{print $2}' | sort -u)
+	if [[ ${#namespaces[@]} -eq 0 ]]; then
+		return 0
+	fi
+
+	log "waiting for namespace(s) ${namespaces[*]}"
+	while [[ $(date +%s) -lt ${deadline} ]]; do
+		missing=0
+		for ns in "${namespaces[@]}"; do
+			kube --request-timeout=15s get namespace "${ns}" >/dev/null 2>&1 || missing=1
+		done
+		if [[ ${missing} -eq 0 ]]; then
+			log "namespace(s) ${namespaces[*]} exist"
+			return 0
+		fi
+		sleep 15
+	done
+	record_failure "the namespace(s) ${namespaces[*]} never appeared; they come from this payload's own manifests/, so either the bootstrap never applied them or the cluster did not get that far"
+	return 1
+}
+
+# Does the cluster answer at all yet?
+#
+# Separate from every other wait because it is the precondition for all of
+# them, and because its failure has a different meaning: the waits below are
+# about something inside a working cluster not happening, this one is about
+# there being no cluster to ask.
+wait_api_serving() {
+	local deadline=$1
+	log "waiting for the cluster API to answer"
+	# `date +%s`, not SECONDS: main() builds its deadline from the epoch, and
+	# this file already has two clocks -- wait_dns_published counts from shell
+	# start. Mixing them silently returns immediately or never.
+	while [[ $(date +%s) -lt ${deadline} ]]; do
+		if kube --request-timeout=15s get namespace default >/dev/null 2>&1; then
+			log "the cluster API is answering"
+			return 0
+		fi
+		sleep 15
+	done
+	return 1
+}
+
+# ------------------------------------------------- console capture on failure
+#
+# WHEN AN INSTALL DIES WAITING FOR MACHINES, THE ONE THING WORTH HAVING IS THE
+# CONSOLE, AND IT IS THE ONE THING NOBODY COLLECTS.
+#
+# Measured on mrb-bar6 2026-11-09: the masters looped 130 times on
+# `GET https://api-int...:22623/config/master: i/o timeout` because the
+# bootstrap never served the machine config server, and the only way to learn
+# that was to go to the OCI console by hand, one instance at a time, after the
+# install had already failed. `openshift-install gather bootstrap` could not
+# help -- it needs SSH, and at that point nothing was reachable.
+#
+# OCI can serve this over its API, with no SSH and no public address:
+# `console-history capture` snapshots the serial console of a running instance
+# and `get-content` returns it. That is a provider capability, not an installer
+# one -- AWS has get-console-output, some clouds have nothing -- which is
+# exactly why it belongs in a hook.
+#
+# URLS ARE REDACTED HERE, NOT LATER. The bootstrap's console contains the
+# pre-signed ignition URL, which grants read access to every day-0 secret in
+# the cluster. Writing it to disk and cleaning up afterwards would already have
+# published it; the redaction happens in the pipe, before anything is stored.
+#
+# TWO PATTERNS, BECAUSE ONE WAS NOT ENOUGH AND THE GAP WAS REAL. Matching
+# `https?://...` alone leaks, because Ignition logs the request a second time
+# without a scheme:
+#
+#   ignition[N]: fetched referenced user config from "/p/<token>/n/<ns>/b/<bucket>/o/<object>"
+#
+# That `/p/<token>` IS the pre-authenticated request. With the region's object
+# storage host -- which is not a secret -- it reconstructs the whole URL.
+# Caught on mrb-bar10 2026-11-10 by scanning the captured file for the PAR
+# shape rather than for the absence of "http", which is the same lesson the
+# workspace guide records about verifying a redaction by the secret's shape and
+# never by the placeholder's presence.
+capture_consoles() {
+	local compartment_id=$1 outdir ocid name hist n=0
+	outdir="${OPENSHIFT_INSTALL_STATE_DIR}/console"
+
+	mkdir -p "${outdir}" || return 0
+	chmod 700 "${outdir}" 2>/dev/null || true
+
+	while IFS=$'\t' read -r ocid name; do
+		[[ -n ${ocid} ]] || continue
+		hist=$(oci compute console-history capture --instance-id "${ocid}" \
+			--query 'data.id' --raw-output 2>/dev/null) || continue
+		[[ -n ${hist} ]] || continue
+		# The snapshot is asynchronous; a short wait is enough for the buffer
+		# that already exists, and this runs on a failure path where a few
+		# seconds cost nothing.
+		sleep 10
+		if oci compute console-history get-content \
+			--instance-console-history-id "${hist}" --length 1000000 --file - 2>/dev/null |
+			sed -E -e 's|https?://[^ ")]*|<URL-REDACTED>|g' \
+				-e 's#/p/[A-Za-z0-9_-]{16,}(/n/[^ ")]*)?#<PAR-REDACTED>#g' \
+				>"${outdir}/${name}.log" 2>/dev/null; then
+			chmod 600 "${outdir}/${name}.log" 2>/dev/null || true
+			n=$((n + 1))
+		else
+			rm -f "${outdir}/${name}.log"
+		fi
+	done <<<"$(oci compute instance list --compartment-id "${compartment_id}" \
+		--lifecycle-state RUNNING \
+		--query "data[?\"freeform-tags\".\"openshift-cluster-id\"=='${INFRA_ID}'].{i:id,n:\"display-name\"}" \
+		--raw-output 2>/dev/null | jq -r '.[]? | [.i, .n] | @tsv')"
+
+	if [[ ${n} -gt 0 ]]; then
+		log "captured ${n} serial console(s) into ${outdir} (URLs redacted)"
+	else
+		log "no serial console could be captured for ${INFRA_ID}"
+	fi
+}
 
 CSR_SIGNER_CLIENT="kubernetes.io/kube-apiserver-client-kubelet"
 CSR_SIGNER_SERVING="kubernetes.io/kubelet-serving"
@@ -423,9 +599,20 @@ main() {
 	public_zone=$(jq -r '.publicZoneId // empty' "${STATE}")
 	lb_nsg=$(jq -r '.serviceLbNsgId // empty' "${STATE}")
 
+	# One deadline for everything that waits, taken once and before the first
+	# of them -- it used to be declared after the CCM apply, which is itself a
+	# wait now.
+	local deadline=$(($(date +%s) + TIMEOUT_SECONDS))
+
 	# 1. Backends for 22623, first -- everything downstream needs the machine
 	#    config server reachable.
 	populate_mcs_backends "${nlb}" "${compartment_id}"
+
+	# 1b. The bootstrap's 6443 backend, which CAPOCI does not add because the
+	#     bootstrap is not labelled control-plane. Before the DNS wait below,
+	#     because that wait exists so the API endpoint can be used and the
+	#     endpoint is this load balancer.
+	populate_apiserver_bootstrap_backend "${nlb}" "${compartment_id}"
 
 	# 2. The first use of the API endpoint in this hook, and therefore the
 	#    first DNS lookup of the public api record. See wait_dns_published for
@@ -440,11 +627,25 @@ main() {
 	#    and is therefore already sealed before the first hook runs. The CCM
 	#    crash-loops from day 0 until this line, which is the visible cost of
 	#    a credential that cannot exist any earlier.
-	log "applying CCM/CSI config"
-	kube apply -f "${CCM_STATE}" >/dev/null
-
-	# One deadline for everything that waits from here on, taken once.
-	local deadline=$(($(date +%s) + TIMEOUT_SECONDS))
+	# WAIT FOR THE API FIRST. This used to apply straight away, and it could
+	# never work: post-provision is invoked moments after the machines are
+	# created, and the bootstrap is still booting -- on mrb-bar9 it was three
+	# minutes past its pivot reboot, with node-image-pull still activating and
+	# nothing listening on 6443. The apply failed, and because it was a bare
+	# command under `set -e` it took the hook with it, before the failure was
+	# recorded and before the consoles were captured.
+	#
+	# The Foo payload has always waited for its CCM namespace before touching
+	# the cluster; this is the same wait, expressed against the one thing that
+	# must be true for any of it: the API answers.
+	if wait_api_serving "${deadline}" && wait_ccm_namespaces "${deadline}"; then
+		log "applying CCM/CSI config"
+		if ! kube apply -f "${CCM_STATE}" >/dev/null 2>&1; then
+			record_failure "could not apply the CCM/CSI configuration from ${CCM_STATE}; the cloud controller manager will crash-loop until it is applied by hand"
+		fi
+	else
+		record_failure "the cluster API never answered within this hook's ${TIMEOUT_SECONDS}s budget, so the CCM/CSI configuration was not applied. Nothing else in this install creates it, and the cloud controller manager cannot start without it"
+	fi
 
 	# 3b. The nodes. Before the address wait, and that order is load-bearing
 	#     for a reason beyond this step's own value: a node joining is what
@@ -474,9 +675,13 @@ main() {
 	if ! apps_ip=$(service_address "${deadline}"); then
 		record_failure "${INPUT_SERVICE} had no load balancer address within this hook's ${TIMEOUT_SECONDS}s budget. Nothing on this platform creates that address except the cloud controller manager this payload delivers, so either it is not running or it cannot reconcile the Service; check 'oc -n ${INPUT_SERVICE%%/*} describe service ${INPUT_SERVICE##*/}' and the CCM's logs. The *.apps record was not created"
 		if [[ ${#FAILED_STEPS[@]} -gt 0 ]]; then
+			# This is the failure the console capture exists for: the wait
+			# for an address the cluster's own CCM must assign, which does
+			# not happen when the machines never finished coming up.
+			capture_consoles "${compartment_id}"
 			local joined
 			joined=$(printf '(%s) ' "${FAILED_STEPS[@]}")
-			die "post-provision ran every step and ${#FAILED_STEPS[@]} failed: ${joined%% }"
+			die "serial consoles are in ${OPENSHIFT_INSTALL_STATE_DIR}/console; ${#FAILED_STEPS[@]} step(s) failed: ${joined%% }"
 		fi
 	fi
 	log "ingress Service has an address; resolving the load balancer behind it"
@@ -519,9 +724,12 @@ main() {
 		'{appsAddress:$ip, appsPrivateAddress:$private, appsNlbId:$nlb}' >"${APPS_STATE}"
 
 	if [[ ${#FAILED_STEPS[@]} -gt 0 ]]; then
+		# Before the error, not after: die() exits, and the console is the
+		# evidence the operator will want precisely because this failed.
+		capture_consoles "${compartment_id}"
 		local joined
 		joined=$(printf '(%s) ' "${FAILED_STEPS[@]}")
-		die "post-provision ran every step and ${#FAILED_STEPS[@]} failed: ${joined%% }"
+		die "serial consoles are in ${OPENSHIFT_INSTALL_STATE_DIR}/console; ${#FAILED_STEPS[@]} step(s) failed: ${joined%% }"
 	fi
 	log "post-provision complete"
 }

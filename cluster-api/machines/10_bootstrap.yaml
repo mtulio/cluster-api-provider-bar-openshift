@@ -51,8 +51,13 @@ kind: Machine
 metadata:
   name: ${INSTALLER_INFRA_ID}-bootstrap
   namespace: openshift-cluster-api-guests
-  labels:
-    cluster.x-k8s.io/control-plane: ""
+  # NO control-plane LABEL, AND ITS ABSENCE IS THE WHOLE MECHANISM.
+  # IsControlPlane() (cloud/scope/machine.go:1031) keys off that label and
+  # selects a launch path that cannot be told which subnet to use. Without it
+  # the worker path applies, the OCIMachine's spec.subnetName is honoured, and
+  # the bootstrap -- and only the bootstrap -- lands in the public subnet that
+  # every other reference payload gives it. The masters keep the private
+  # control-plane subnet they already had. See ../cluster.yaml, subnet-bootstrap.
 spec:
   clusterName: ${INSTALLER_INFRA_ID}
   bootstrap:
@@ -72,7 +77,12 @@ metadata:
   name: ${INSTALLER_INFRA_ID}-bootstrap
   namespace: openshift-cluster-api-guests
   labels:
-    cluster.x-k8s.io/control-plane: ""
+    # NO control-plane LABEL, AND ITS ABSENCE IS THE WHOLE MECHANISM.
+    # IsControlPlane() (cloud/scope/machine.go:1031) keys off this label
+    # and selects a launch path that cannot be told which subnet to use.
+    # Without it the worker path applies, spec.subnetName below is
+    # honoured, and the bootstrap lands in the public subnet every other
+    # reference payload puts it in. See ../cluster.yaml, subnet-bootstrap.
     install.openshift.io/bootstrap: ""
 spec:
   compartmentId: ${OCI_COMPARTMENT_ID}
@@ -152,8 +162,20 @@ spec:
   #     address, which the control-plane NSG permits from the whole VCN;
   #   - the control-plane NSG, which the role-based selection attaches for the
   #     same reason it chose this subnet -- here the default is what we wanted.
+  # TOP-LEVEL, not networkDetails.subnetName. Two fields share that name and
+  # only this one is read, and only by getWorkerMachineSubnet (:1075) -- see
+  # the note above.
+  subnetName: ${INSTALLER_INFRA_ID}-subnet-bootstrap
   networkDetails:
-    assignPublicIp: false
+    # The point of all of the above. `gather bootstrap` has no other way in,
+    # and a bootstrap that fails is exactly when it is needed.
+    assignPublicIp: true
+    # Named, because the worker path would otherwise attach the worker NSG and
+    # this machine serves 6443 and 22623 to the control plane. getWorkerMachineNSGs
+    # (:1091) matches any NSG by name regardless of its role, so naming the
+    # control-plane group keeps the rules this machine actually needs.
+    nsgNames:
+    - control-plane
   freeformTags:
     openshift-cluster-id: ${INSTALLER_INFRA_ID}
     # Read by hooks/post-provision.sh to find the instances that

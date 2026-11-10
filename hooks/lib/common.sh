@@ -167,6 +167,15 @@ MCS_PORT=22623
 MCS_LISTENER="mcs-listener"
 MCS_BACKENDSET="mcs-backendset"
 
+# CAPOCI's own backend set for the API server, created by its cluster
+# reconciler. Named here because post-provision has to add the bootstrap to it
+# by hand: CAPOCI registers a machine there only when IsControlPlane() is true
+# (cloud/scope/machine.go:322,337), and the bootstrap deliberately does not
+# carry that label -- it is how it reaches the public subnet. See
+# ../cluster-api/machines/10_bootstrap.yaml.
+APISERVER_BACKENDSET="apiserver-lb-backendset"
+APISERVER_PORT=6443
+
 # The OCIClusterIdentity Secret.
 #
 # NOT IN THIS IMAGE, AND IT NEVER WILL BE. It holds an OCI API signing key,
@@ -522,16 +531,54 @@ wait_dns_published() {
 		if [[ ${found} == yes ]]; then
 			log "${fqdn} is published on every authoritative nameserver"
 			# Only now is it safe to let the recursive resolver see this name.
-			[[ -n $(getent hosts "${fqdn}" 2>/dev/null || true) ]] && return 0
-			log "${fqdn} answers authoritatively but not through this host's resolver."
-			log "  A negative answer for it is cached locally; it will expire on"
-			log "  its own in up to the zone's SOA minimum. To clear it now:"
-			log "      resolvectl flush-caches"
-			die "local resolver has a stale NXDOMAIN for ${fqdn}"
+			wait_local_resolver "${fqdn}" "${deadline}"
+			return $?
 		fi
 		sleep 10
 	done
 	die "${fqdn} did not publish on its authoritative nameservers within 10m"
+}
+
+# A NEGATIVE ANSWER CACHED LOCALLY IS A WAIT, NOT A FAILURE, AND TREATING IT AS
+# A FAILURE COST TWO RUNS.
+#
+# This used to check the host's resolver once, immediately after confirming
+# authoritative publication, and die if it disagreed. It disagrees routinely:
+# something queries api.<cluster>.<domain> before the record exists -- the
+# installer validates that the name is free -- and the recursive resolver
+# caches the NXDOMAIN for up to the zone's SOA minimum. Measured on mrb-bar6
+# and again on mrb-bar7, 2026-11-09: both died here, both with the record
+# correctly published on all four authoritative nameservers, and both
+# recovered the moment the cache was flushed by hand.
+#
+# So it waits instead, inside the budget the caller already set. A flush is
+# attempted first because it turns minutes into nothing when the hook has the
+# privilege, and is ignored when it does not -- an unprivileged hook must not
+# fail for lacking a convenience.
+wait_local_resolver() {
+	local fqdn=$1 deadline=$2
+
+	if [[ -n $(getent hosts "${fqdn}" 2>/dev/null || true) ]]; then
+		return 0
+	fi
+
+	log "${fqdn} answers authoritatively but not yet through this host's resolver;"
+	log "  a negative answer is cached locally. Waiting for it to expire."
+	if command -v resolvectl >/dev/null 2>&1; then
+		resolvectl flush-caches >/dev/null 2>&1 || true
+	fi
+
+	while ((SECONDS < deadline)); do
+		if [[ -n $(getent hosts "${fqdn}" 2>/dev/null || true) ]]; then
+			log "${fqdn} now resolves through this host's resolver"
+			return 0
+		fi
+		sleep 10
+	done
+
+	log "  Still cached after the wait. To clear it by hand:"
+	log "      resolvectl flush-caches"
+	die "local resolver has a stale NXDOMAIN for ${fqdn} and it did not expire within the wait"
 }
 
 delete_rrset() {

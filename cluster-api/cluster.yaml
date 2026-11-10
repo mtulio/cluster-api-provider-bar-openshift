@@ -164,6 +164,40 @@ spec:
         name: ${INSTALLER_INFRA_ID}-subnet-worker
         cidr: 10.0.64.0/20
         type: private
+      # The bootstrap machine's subnet, and the reason it carries the WORKER
+      # role for a machine that is plainly not a worker.
+      #
+      # Every other reference payload, and every integrated platform, gives the
+      # bootstrap a public address: it is the one machine an operator SSHes to
+      # when an install fails, and `openshift-install gather bootstrap` has no
+      # other way in. The Foo payload does it in one line, because CAPA picks a
+      # public subnet for any machine asking for a public IP.
+      #
+      # CAPOCI has no such behaviour. It selects a machine's subnet by ROLE,
+      # and for anything with the control-plane label it takes the FIRST
+      # control-plane-role subnet unconditionally -- getGetControlPlaneMachineSubnet
+      # (cloud/scope/machine.go:1043) never reads a name. Only the worker path
+      # honours one (getWorkerMachineSubnet, :1075, against the TOP-LEVEL
+      # spec.subnetName). So a named subnet is reachable only from that path.
+      #
+      # Making the existing control-plane subnet public instead was considered
+      # and is wrong: `type` decides the route table, public routes 0.0.0.0/0
+      # to the internet gateway, and the masters have no public address -- they
+      # would lose egress and never pull the release payload.
+      #
+      # LISTED AFTER the worker subnet on purpose. getWorkerMachineSubnet
+      # returns the first worker-role subnet when a machine names none, so the
+      # ordinary workers keep landing in the private one above.
+      #
+      # WHAT THIS COSTS, STATED PLAINLY. Dropping the control-plane label to
+      # reach this path also drops CAPOCI's automatic registration of the
+      # machine into apiserver-lb-backendset, which is gated on IsControlPlane()
+      # (machine.go:322,337). hooks/post-provision.sh adds it back, the same way
+      # it already fills the 22623 backend set by hand.
+      - role: worker
+        name: ${INSTALLER_INFRA_ID}-subnet-bootstrap
+        cidr: 10.0.16.0/28
+        type: public
       # The OCI CCM creates LoadBalancer Services into this subnet, and its
       # OCID is one of the four values the CCM config needs. The infraReady
       # hook reads it back out of

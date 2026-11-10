@@ -28,17 +28,28 @@ reject_args "$@"
 # more correct than deleting the load balancer behind the CCM's back. If the
 # API is already gone, fall back to deleting by tag.
 destroy_ingress() {
-	local ns name
-	ns=${INPUT_SERVICE%%/*}
-	name=${INPUT_SERVICE##*/}
+	local ns name service
 
-	if [[ -z ${INPUT_SERVICE} ]]; then
-		# pre-destroy takes no arguments, so recover the Service from the
-		# install-config's post-provision args if they are reachable; failing
-		# that, fall through to the tag sweep.
-		ns=openshift-ingress
-		name=router-external-default
-	fi
+	# INPUT_SERVICE BELONGS TO post-provision AND IS NEVER SET IN THIS PHASE.
+	#
+	# This used to read it into ns and name first and test it for emptiness
+	# afterwards, which cannot work under `set -u`: the parameter is unset, not
+	# empty, so the first expansion aborts the hook and the guard below it is
+	# never reached. Measured on mrb-bar6 2026-11-09 --
+	#
+	#   pre-destroy.sh: line 32: INPUT_SERVICE: unbound variable
+	#
+	# -- and the teardown stopped there, with six instances, a VCN and a load
+	# balancer still running. It stayed latent until that run because this
+	# function is reached only after the bootstrap-ignition cleanup above
+	# finds something to clean, which needs the ignition hook to have
+	# succeeded; until then every teardown returned before getting here.
+	#
+	# The default is the Service this payload's own manifests create, which is
+	# the same fact post-provision defaults to.
+	service=${INPUT_SERVICE:-openshift-ingress/router-external-default}
+	ns=${service%%/*}
+	name=${service##*/}
 
 	if [[ -n ${OPENSHIFT_INSTALL_KUBECONFIG:-} ]] &&
 		kube -n "${ns}" get service "${name}" >/dev/null 2>&1; then
@@ -229,14 +240,67 @@ restore_provider_credentials() {
 		return 0
 	fi
 
-	# apply, not create: a re-run of a failed destroy must not fail here.
-	# Output is the object reference only; `oc apply` never echoes Secret data.
-	if oc --kubeconfig "${kubeconfig}" apply -f "${secret}" >/dev/null 2>&1; then
-		log "restored the CAPOCI credential Secret into the local control plane"
-	else
-		log "WARNING: could not apply ${secret} to the local control plane;"
+	# THE NAME HAS TO BE REWRITTEN, AND APPLYING THE FILE VERBATIM DID NOT WORK.
+	#
+	# OCIClusterIdentity.spec.principalSecret names ${INFRA_ID}-oci-credentials,
+	# which is per-run, while the file on disk is a template the operator keeps
+	# across runs -- its metadata.name is a placeholder. Applying it unchanged
+	# creates a Secret under the wrong name, CAPOCI still finds nothing, and the
+	# finalizer still never clears. Measured on mrb-bar5 2026-11-09: the delete
+	# hung on ocicluster.infrastructure.cluster.x-k8s.io until the correctly
+	# named Secret was applied by hand, after which the OCICluster, the VCN and
+	# the load balancer went away within three minutes.
+	#
+	# The hook is the right place to do the rewrite because it is the only
+	# party that knows both halves: the operator's file and this run's INFRA_ID.
+	#
+	# Rendered by python rather than sed: the document embeds a PEM private key
+	# as a block scalar, and line-oriented munging of a block scalar is exactly
+	# the construct that produced the dangling-key bug recorded in the workspace
+	# guide. Nothing is written to stdout.
+	local renamed
+	renamed=$(mktemp) || return 0
+	chmod 600 "${renamed}"
+	if ! python3 -I - "${secret}" "${INFRA_ID}-oci-credentials" "${renamed}" <<-'PY'
+		import sys, yaml
+		src, name, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+		doc = yaml.safe_load(open(src))
+		if not doc or doc.get("kind") != "Secret":
+		    sys.exit("%s is not a Secret document" % src)
+		doc.setdefault("metadata", {})["name"] = name
+		doc["metadata"]["namespace"] = "openshift-cluster-api-guests"
+		with open(dst, "w") as f:
+		    yaml.safe_dump(doc, f, default_flow_style=False, sort_keys=False)
+	PY
+	then
+		rm -f "${renamed}"
+		log "WARNING: could not rename the credential Secret to ${INFRA_ID}-oci-credentials;"
 		log "WARNING: the delete below will probably hang on the OCICluster finalizer"
+		return 0
 	fi
+
+	# Retried, because pre-destroy can win a race it should not: the local
+	# control plane is started just before this hook and may not be serving on
+	# the first attempt. A single try that lost that race is indistinguishable
+	# from a credential that does not exist, and the cost of being wrong is
+	# cloud resources nobody deletes.
+	#
+	# apply, not create: a re-run of a failed destroy must not fail here.
+	# `oc apply` echoes the object reference only, never Secret data.
+	local attempt=0
+	while [[ ${attempt} -lt 10 ]]; do
+		attempt=$((attempt + 1))
+		if oc --kubeconfig "${kubeconfig}" apply -f "${renamed}" >/dev/null 2>&1; then
+			rm -f "${renamed}"
+			log "restored the CAPOCI credential Secret as ${INFRA_ID}-oci-credentials"
+			return 0
+		fi
+		sleep 6
+	done
+	rm -f "${renamed}"
+	log "WARNING: could not apply the credential Secret to the local control plane"
+	log "WARNING: after 60s; the delete below will probably hang on the"
+	log "WARNING: OCICluster finalizer, leaving the VCN and NLB behind."
 }
 main() {
 	# First, because everything after it depends on CAPOCI being able to talk
