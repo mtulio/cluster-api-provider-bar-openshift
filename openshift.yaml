@@ -166,6 +166,45 @@ spec:
     # Measured on mrb-bar3, 2026-11-09.
     - --init-oci-clients-on-startup=false
 
+    # The environment this payload cannot start without.
+    #
+    # Checked by the installer before the local control plane starts and
+    # before any cloud resource exists. Every name here was learned the
+    # expensive way: each one, left unset, produced a failure that named
+    # something else and cost a run.
+    #
+    #   OCI_CLI_CONFIG_FILE            the oci CLI reads it implicitly, so a
+    #                                  hook that is missing it fails deep
+    #                                  inside an `oci` invocation
+    #   OCI_PROVIDER_CREDENTIALS_FILE  the CAPOCI identity Secret. common.sh
+    #                                  falls back to a path in the install
+    #                                  directory that nothing creates, so the
+    #                                  fallback is not a default -- it is a
+    #                                  later, more confusing failure, which is
+    #                                  exactly what happened on mrb-bar5
+    #   OCI_IGNITION_BUCKET            hooks/ignition.sh uploads the bootstrap
+    #                                  ignition into it
+    #   OCI_REGION, OCI_CLI_REGION     both are read, by different code paths
+    #                                  (the CCM config render and the bucket),
+    #                                  and common.sh already treats each as
+    #                                  mandatory with :?
+    #
+    # Not declared, because each has a real default: OCI_CCM_AUTH and
+    # OCI_IGNITION_PAR_TTL_HOURS. Declaring a defaulted name would fail
+    # installs that work.
+    #
+    # NOT declared either: AUTH_CONFIG_DIR. CAPOCI reads it only when
+    # --init-oci-clients-on-startup is true, and this payload sets it false
+    # above -- the credential arrives per cluster through the
+    # OCIClusterIdentity instead. If a future payload flips that flag, this is
+    # the list that has to grow.
+    requiredEnv:
+    - OCI_CLI_CONFIG_FILE
+    - OCI_PROVIDER_CREDENTIALS_FILE
+    - OCI_IGNITION_BUCKET
+    - OCI_REGION
+    - OCI_CLI_REGION
+
     # A single file, not a directory. Every clusterctl provider already
     # publishes exactly one infrastructure-components.yaml.
     #
